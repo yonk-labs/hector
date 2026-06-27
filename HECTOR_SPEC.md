@@ -44,6 +44,7 @@ The output should be boring enough for a cheap builder model to execute and stri
 ```text
 hector plan --task "..." [--spec file.md] [--out campaign.yaml]
 hector check --file campaign.yaml
+hector review --campaign campaign.yaml --bob-result result.json
 hector init
 hector mcp
 ```
@@ -51,6 +52,8 @@ hector mcp
 `plan` emits a campaign, but may return `human_questions` instead of slices when the desired behavior is ambiguous.
 
 `check` validates an existing campaign before Bob sees it.
+
+`review` compares Bob's result to Hector's intended campaign and decides whether to accept, revise, split, or ask a human.
 
 `init` writes a starter `hector.yaml`.
 
@@ -100,6 +103,51 @@ Output:
 ```
 
 Findings use `error` for blockers and `warning` for orchestrator review.
+
+### `review_result`
+
+Input:
+
+```json
+{
+  "campaign": { "...": "original Bob campaign" },
+  "bob_result": {
+    "status": "needs_review",
+    "next_action": "review_candidate",
+    "changed_files": ["src/planner.rs"],
+    "scope": { "within": true },
+    "verify": { "passed": true },
+    "judge": { "verdict": "uncertain", "critique": "..." }
+  }
+}
+```
+
+Output:
+
+```json
+{
+  "decision": "accept_for_human_review",
+  "revised_campaign": null,
+  "findings": []
+}
+```
+
+Allowed decisions:
+
+- `accept`
+- `accept_for_human_review`
+- `revise_campaign`
+- `split_task`
+- `ask_human`
+
+Review rules:
+
+- If Bob changed files outside `editable_paths`, reject and revise scope/spec.
+- If Bob edited frozen tests, fix the Hector test/spec first, then rerun Bob.
+- If Bob returns `scope_exceeded`, split or tighten the slice.
+- If Bob returns repeated verify failure, make the verify failure the next spec detail.
+- If Bob returns `needs_review`, compare Abe's critique to the final diff and either accept for human review or write a narrower follow-up.
+- If Bob adds dependency churn not explicitly allowed, reject.
 
 ## Campaign Output
 
@@ -191,6 +239,7 @@ Config is project policy. Per-plan CLI/MCP inputs may narrow scope, but should n
 3. Add repo convention discovery: package manager, test runner, language, existing test folders.
 4. Add `plan` as a conservative planner that can emit `human_questions`.
 5. Add MCP wrappers over `plan` and `check`.
-6. Add optional red/green probe support for newly written tests.
+6. Add `review` over Bob structured results.
+7. Add optional red/green probe support for newly written tests.
 
 Do not implement production-code generation in Hector.
