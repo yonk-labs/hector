@@ -8,6 +8,7 @@ struct Campaign {
 
 #[derive(Deserialize)]
 struct Slice {
+    task: Option<String>,
     verify_cmds: Option<Vec<String>>,
     editable_paths: Vec<String>,
     max_changed_files: Option<u64>,
@@ -27,16 +28,29 @@ pub fn check(path: &Path) -> anyhow::Result<()> {
     }
 
     for slice in &campaign.slices {
-        if slice.verify_cmds.as_ref().is_none_or(Vec::is_empty) {
+        if slice.task.as_ref().is_none_or(|s| s.trim().is_empty()) {
+            anyhow::bail!("slice missing task");
+        }
+        if slice
+            .verify_cmds
+            .as_ref()
+            .is_none_or(|cmds| cmds.iter().all(|c| c.trim().is_empty()))
+        {
             anyhow::bail!("slice missing verify_cmds");
         }
-        if slice.max_changed_files.is_none() {
+        if slice.editable_paths.is_empty() {
+            anyhow::bail!("slice missing editable_paths");
+        }
+        if slice.max_changed_files.is_none_or(|n| n == 0) {
             anyhow::bail!("slice missing max_changed_files");
         }
-        if slice.max_changed_lines.is_none() {
+        if slice.max_changed_lines.is_none_or(|n| n == 0) {
             anyhow::bail!("slice missing max_changed_lines");
         }
         for editable_path in &slice.editable_paths {
+            if is_unsafe_path(editable_path) {
+                anyhow::bail!("unsafe path: {editable_path}");
+            }
             if is_test_path(editable_path) {
                 anyhow::bail!("test files must be reference-only: {editable_path}");
             }
@@ -46,6 +60,11 @@ pub fn check(path: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_unsafe_path(path: &str) -> bool {
+    let p = Path::new(path);
+    p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir))
 }
 
 fn is_test_path(path: &str) -> bool {
@@ -59,13 +78,16 @@ fn is_test_path(path: &str) -> bool {
 }
 
 fn is_dependency_file(path: &str) -> bool {
+    let name = Path::new(path).file_name().and_then(|s| s.to_str());
     matches!(
-        path,
-        "Cargo.toml"
-            | "Cargo.lock"
-            | "package.json"
-            | "package-lock.json"
-            | "pnpm-lock.yaml"
-            | "yarn.lock"
+        name,
+        Some(
+            "Cargo.toml"
+                | "Cargo.lock"
+                | "package.json"
+                | "package-lock.json"
+                | "pnpm-lock.yaml"
+                | "yarn.lock"
+        )
     )
 }

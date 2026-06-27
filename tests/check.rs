@@ -127,3 +127,74 @@ slices:
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("max_changed_files"));
 }
+
+#[test]
+fn empty_required_fields_fail() {
+    let out = hector_check(
+        r#"
+name: bad
+slices:
+  - task: ""
+    verify_cmds: [""]
+    editable_paths: []
+    max_changed_files: 0
+    max_changed_lines: 0
+"#,
+    );
+    assert!(!out.status.success());
+}
+
+#[test]
+fn missing_editable_paths_fails() {
+    let out = hector_check(
+        r#"
+name: bad
+slices:
+  - task: No writable scope.
+    verify_cmds: ["cargo test focused"]
+    max_changed_files: 1
+    max_changed_lines: 80
+"#,
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("editable_paths"));
+}
+
+#[test]
+fn dangerous_paths_fail() {
+    for path in ["/tmp/x.rs", "../src/lib.rs", "src/../tests/check.rs"] {
+        let out = hector_check(&format!(
+            r#"
+name: bad
+slices:
+  - task: Dangerous path.
+    verify_cmds: ["cargo test focused"]
+    editable_paths: ["{path}"]
+    max_changed_files: 1
+    max_changed_lines: 80
+"#
+        ));
+        assert!(!out.status.success(), "{path}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unsafe path"),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn dependency_churn_in_subdir_fails() {
+    let out = hector_check(
+        r#"
+name: bad
+slices:
+  - task: Add one helper.
+    verify_cmds: ["cargo test focused"]
+    editable_paths: ["frontend/package.json"]
+    max_changed_files: 1
+    max_changed_lines: 80
+"#,
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("dependency churn"));
+}

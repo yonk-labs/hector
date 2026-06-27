@@ -39,6 +39,31 @@ Hector does not own:
 
 The output should be boring enough for a cheap builder model to execute and strict enough that cheating is hard.
 
+## Orchestrator Input Contract
+
+Hector should ask the orchestrator for only the fields needed to create an executable gate:
+
+- desired observable behavior
+- allowed editable areas
+- forbidden changes
+- verification command, if known
+- whether dependency or lockfile changes are allowed
+- UX/product decisions that must be settled before tests are written
+
+If the orchestrator provides a full PRD, Hector breaks it down by proof, not by section. Each slice should answer: "What is the smallest behavior a command can prove?" A single PRD requirement can become multiple Bob slices when it needs multiple independent gates.
+
+## Guardrail Layers
+
+Hector uses layered guardrails:
+
+- Input guardrails: block ambiguous behavior, missing proof, or unsettled product decisions.
+- Campaign guardrails: require `verify_cmds`, `editable_paths`, scope caps, and non-empty tasks.
+- Path guardrails: reject absolute paths, parent traversal, test paths, and dependency/lockfile paths unless explicitly allowed.
+- Handoff guardrails: pass tests as `reference_paths`, implementation as `editable_paths`, and keep Bob's `max_changed_*` caps narrow.
+- Result guardrails: compare Bob's `changed_files`, `scope`, `verify`, `judge`, `status`, and `next_action` against the original campaign before accepting work.
+
+Abe-before-Bob is conditional. Run local `hector check` first. Ask Abe to review a campaign before Bob when the slice is broad, multi-file, touches tests, allows dependencies, or has ambiguous acceptance criteria.
+
 ## CLI Surface
 
 ```text
