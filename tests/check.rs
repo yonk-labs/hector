@@ -1,11 +1,15 @@
 use std::fs;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn tmp_file(name: &str, body: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "hector-check-{}-{:?}",
+        "hector-check-{}-{:?}-{}",
         std::process::id(),
-        std::thread::current().id()
+        std::thread::current().id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -19,6 +23,13 @@ fn hector_check(body: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_hector"))
         .args(["check", "--file"])
         .arg(path)
+        .output()
+        .unwrap()
+}
+
+fn hector(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_hector"))
+        .args(args)
         .output()
         .unwrap()
 }
@@ -197,4 +208,190 @@ slices:
     );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("dependency churn"));
+}
+
+#[test]
+fn plan_needs_input_without_verify_or_editable_paths() {
+    let out = hector(&["plan", "--task", "Add a useful behavior"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"status\": \"needs_input\""));
+    assert!(stdout.contains("What command proves this slice is correct?"));
+    assert!(stdout.contains("Which files or directories may Bob edit?"));
+}
+
+#[test]
+fn plan_emits_campaign_that_check_accepts() {
+    let out = hector(&[
+        "plan",
+        "--name",
+        "tiny-client",
+        "--task",
+        "Add a tiny client helper.",
+        "--verify",
+        "cargo test tiny_client",
+        "--editable-path",
+        "src/client.rs",
+        "--reference-path",
+        "tests/client.rs",
+        "--max-changed-files",
+        "1",
+        "--max-changed-lines",
+        "80",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("slices:"));
+    assert!(stdout.contains("editable_paths:"));
+
+    let campaign = tmp_file("campaign.yaml", &stdout);
+    let checked = Command::new(env!("CARGO_BIN_EXE_hector"))
+        .args(["check", "--file"])
+        .arg(campaign)
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+}
+
+#[test]
+fn review_accepts_clean_completed_result() {
+    let campaign = tmp_file(
+        "campaign.yaml",
+        r#"
+name: review-ok
+slices:
+  - task: Implement the reviewed thing.
+    verify_cmds: ["cargo test reviewed"]
+    editable_paths: ["src/planner.rs"]
+    max_changed_files: 1
+    max_changed_lines: 80
+"#,
+    );
+    let result = tmp_file(
+        "result.json",
+        r#"{"status":"completed","changed_files":["src/planner.rs"]}"#,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_hector"))
+        .args(["review", "--campaign"])
+        .arg(campaign)
+        .arg("--bob-result")
+        .arg(result)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"decision\": \"accept\""));
+}
+
+#[test]
+fn review_rejects_out_of_scope_prefix_escape() {
+    let campaign = tmp_file(
+        "campaign.yaml",
+        r#"
+name: review-bad
+slices:
+  - task: Implement a scoped thing.
+    verify_cmds: ["cargo test scoped"]
+    editable_paths: ["src"]
+    max_changed_files: 1
+    max_changed_lines: 80
+"#,
+    );
+    let result = tmp_file(
+        "result.json",
+        r#"{"status":"completed","changed_files":["src2/planner.rs"]}"#,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_hector"))
+        .args(["review", "--campaign"])
+        .arg(campaign)
+        .arg("--bob-result")
+        .arg(result)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"decision\": \"revise_campaign\""));
+    assert!(stdout.contains("changed file outside editable_paths"));
+}
+
+#[test]
+fn review_sends_needs_review_to_human() {
+    let campaign = tmp_file(
+        "campaign.yaml",
+        r#"
+name: review-human
+slices:
+  - task: Implement a thing needing judgment.
+    verify_cmds: ["cargo test judgment"]
+    editable_paths: ["src/planner.rs"]
+    max_changed_files: 1
+    max_changed_lines: 80
+"#,
+    );
+    let result = tmp_file(
+        "result.json",
+        r#"{"status":"needs_review","next_action":"review_candidate","changed_files":["src/planner.rs"]}"#,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_hector"))
+        .args(["review", "--campaign"])
+        .arg(campaign)
+        .arg("--bob-result")
+        .arg(result)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("\"decision\": \"accept_for_human_review\"")
+    );
+}
+
+#[test]
+fn review_splits_scope_exceeded_variants() {
+    let campaign = tmp_file(
+        "campaign.yaml",
+        r#"
+name: review-split
+slices:
+  - task: Implement a thing that was too broad.
+    verify_cmds: ["cargo test broad"]
+    editable_paths: ["src/planner.rs"]
+    max_changed_files: 1
+    max_changed_lines: 80
+"#,
+    );
+    let result = tmp_file(
+        "result.json",
+        r#"{"status":"scope_exceeded","changed_files":["src/planner.rs"]}"#,
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_hector"))
+        .args(["review", "--campaign"])
+        .arg(campaign)
+        .arg("--bob-result")
+        .arg(result)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"decision\": \"split_task\""));
+}
+
+#[test]
+fn frontier_brief_explains_handoff_contract() {
+    let out = hector(&["frontier-brief"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Hector Frontier Brief"));
+    assert!(stdout.contains("hector plan"));
+    assert!(stdout.contains("editable_paths"));
+    assert!(stdout.contains("needs_input"));
 }

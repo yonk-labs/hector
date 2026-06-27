@@ -70,6 +70,7 @@ Abe-before-Bob is conditional. Run local `hector check` first. Ask Abe to review
 hector plan --task "..." [--spec file.md] [--out campaign.yaml]
 hector check --file campaign.yaml
 hector review --campaign campaign.yaml --bob-result result.json
+hector frontier-brief
 hector init
 hector mcp
 ```
@@ -80,11 +81,17 @@ hector mcp
 
 `review` compares Bob's result to Hector's intended campaign and decides whether to accept, revise, split, or ask a human.
 
+`frontier-brief` prints the contract frontier orchestrators should follow when writing Hector-ready slices.
+
 `init` writes a starter `hector.yaml`.
 
 `mcp` exposes the same operations to a frontier orchestrator.
 
 ## MCP Tools
+
+### `frontier_brief`
+
+Output: the same frontier-orchestrator instructions as `hector frontier-brief`.
 
 ### `plan_campaign`
 
