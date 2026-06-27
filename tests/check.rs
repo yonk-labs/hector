@@ -80,6 +80,23 @@ slices:
 }
 
 #[test]
+fn nested_test_directory_fails() {
+    let out = hector_check(
+        r#"
+name: bad
+slices:
+  - task: Cheat a nested test helper.
+    verify_cmds: ["cargo test focused"]
+    editable_paths: ["src/tests/helper.rs"]
+    max_changed_files: 1
+    max_changed_lines: 80
+"#,
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("test files must be reference-only"));
+}
+
+#[test]
 fn dependency_churn_fails() {
     let out = hector_check(
         r#"
