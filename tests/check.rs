@@ -2,7 +2,11 @@ use std::fs;
 use std::process::Command;
 
 fn tmp_file(name: &str, body: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("hector-check-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "hector-check-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
