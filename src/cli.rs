@@ -83,6 +83,19 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Dispatch a campaign's slices in parallel to bob across multiple model endpoints.
+    /// Each slice runs as a separate `bob build` process, bounded by --jobs.
+    Dispatch {
+        /// Campaign YAML file to dispatch.
+        #[arg(long)]
+        file: PathBuf,
+        /// Max concurrent bob processes (default: number of slices, capped at 6).
+        #[arg(long, default_value = "4")]
+        jobs: usize,
+        /// Bob binary path (default: "bob" on PATH).
+        #[arg(long)]
+        bob_cmd: Option<String>,
+    },
     /// Run the stdio MCP server.
     Mcp,
 }

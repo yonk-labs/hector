@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod conventions;
+mod dispatch;
 mod guidance;
 mod mcp;
 mod model;
@@ -163,6 +164,11 @@ if verify_cmds.iter().all(|c| c.trim().is_empty()) {
                 anyhow::bail!("hector.yaml already exists; use --force to overwrite");
             }
             std::fs::write(path, config::DEFAULT_CONFIG)?;
+            Ok(())
+        }
+        Command::Dispatch { file, jobs, bob_cmd } => {
+            let report = dispatch::run_campaign(&file, jobs, bob_cmd.as_deref().unwrap_or("bob")).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         Command::Mcp => mcp::serve().await,
