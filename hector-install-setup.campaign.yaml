@@ -1,0 +1,137 @@
+name: hector-install-setup
+auto_commit: true
+slices:
+  - name: config-loader-module
+    task: Add a tiny `hector.yaml` config loader module.
+    spec: |
+      Add `src/config.rs` and wire it into the crate with `mod config;`.
+      The loader should read optional `hector.yaml` from the current working
+      directory and return optional plan defaults for:
+      - `scope.default_max_changed_files`
+      - `scope.default_max_changed_lines`
+      - `judge.default_policy`
+      - `bob.campaign_auto_commit`
+
+      Keep it boring: derive `Deserialize`, use `serde_yaml::from_str`, and do
+      not manually walk `serde_yaml::Value`. Missing `hector.yaml` returns no
+      defaults. Bad YAML or invalid config types should return an error that
+      mentions `hector.yaml`. No new dependencies.
+    verify_cmds:
+      - cargo check
+      - |
+        bash -lc 'set -e; test "$(wc -l < src/config.rs)" -le 90; rg "serde_yaml::from_str" src/config.rs; ! rg "serde_yaml::Value" src/config.rs'
+    editable_paths:
+      - src/config.rs
+      - src/main.rs
+    reference_paths:
+      - HECTOR_SPEC.md
+      - tests/check.rs
+    judge_policy: retry_on_fail
+    max_iters: 4
+    max_changed_files: 2
+    max_changed_lines: 120
+
+  - name: wire-plan-config-defaults
+    task: Make `hector plan` consume config defaults with CLI precedence.
+    spec: |
+      Wire `hector plan` to the config loader.
+
+      If `hector.yaml` exists in the current working directory, `hector plan`
+      uses defaults from:
+      - `scope.default_max_changed_files`
+      - `scope.default_max_changed_lines`
+      - `judge.default_policy`
+      - `bob.campaign_auto_commit`
+
+      If no config exists, keep today's defaults. CLI flags override config for
+      changed-file cap, changed-line cap, and judge policy. `--no-auto-commit`
+      still forces `auto_commit: false`. To distinguish omitted flags from
+      explicit flags, make only the affected CLI fields optional and apply
+      built-in defaults after config is read. Do not create or leave scratch
+      files such as bad.out or bad.err in the repo.
+    verify_cmds:
+      - |
+        bash -lc 'set -e; repo=$(pwd); tmp=$(mktemp -d); bad_out="/tmp/hector-bad-$$.out"; bad_err="/tmp/hector-bad-$$.err"; trap "rm -f \"$bad_out\" \"$bad_err\"" EXIT; printf "scope:\n  default_max_changed_files: 1\n  default_max_changed_lines: 77\njudge:\n  default_policy: ask_human\nbob:\n  campaign_auto_commit: false\n" > "$tmp/hector.yaml"; (cd "$tmp" && cargo run --quiet --manifest-path "$repo/Cargo.toml" -- plan --task "Use config defaults." --verify "true" --editable-path src/lib.rs > campaign.yaml); grep -q "auto_commit: false" "$tmp/campaign.yaml"; grep -q "max_changed_files: 1" "$tmp/campaign.yaml"; grep -q "max_changed_lines: 77" "$tmp/campaign.yaml"; grep -q "judge_policy: ask_human" "$tmp/campaign.yaml"; (cd "$tmp" && cargo run --quiet --manifest-path "$repo/Cargo.toml" -- plan --task "Override config defaults." --verify "true" --editable-path src/lib.rs --max-changed-files 3 --max-changed-lines 88 --judge-policy retry_on_fail > override.yaml); grep -q "max_changed_files: 3" "$tmp/override.yaml"; grep -q "max_changed_lines: 88" "$tmp/override.yaml"; grep -q "judge_policy: retry_on_fail" "$tmp/override.yaml"; printf "scope: [" > "$tmp/hector.yaml"; if (cd "$tmp" && cargo run --quiet --manifest-path "$repo/Cargo.toml" -- plan --task "Bad config." --verify "true" --editable-path src/lib.rs > "$bad_out" 2> "$bad_err"); then echo "bad config should fail"; exit 1; fi; grep -q "hector.yaml" "$bad_err" || grep -q "hector.yaml" "$bad_out"; test ! -e bad.out; test ! -e bad.err'
+    editable_paths:
+      - src/cli.rs
+      - src/config.rs
+      - src/main.rs
+    reference_paths:
+      - HECTOR_SPEC.md
+      - tests/check.rs
+    judge_policy: retry_on_fail
+    max_iters: 4
+    max_changed_files: 3
+    max_changed_lines: 140
+
+  - name: safe-init-and-docs
+    task: Make `hector init` safe and document install/setup/config.
+    spec: |
+      `hector init` writes the existing starter `hector.yaml` when no config
+      exists. If `hector.yaml` already exists, it must exit nonzero with a clear
+      message and leave the file untouched. Add `hector init --force` to
+      overwrite intentionally. Keep the template content equivalent to the
+      current starter config.
+
+      Update README.md with a direct install/setup path:
+      - install from this repo with `cargo install --path .`
+      - initialize a project with `hector init`
+      - explain what `hector.yaml` controls
+      - show the MCP command as `hector mcp`
+      - show the Hector -> Bob -> Hector review loop
+      - explain that "run it" in a Hector context means `hector check` and tests,
+        not Bob execution unless Bob is explicitly requested
+      - document Bob's multi-slice preflight: `auto_commit: true` requires a
+        clean checkout, so use a clean worktree or stop before running Bob
+
+      Update HECTOR_SPEC.md only where needed so the config section says these
+      are config defaults consumed by the CLI. Do not add package-manager,
+      release, or dependency instructions.
+    verify_cmds:
+      - |
+        bash -lc 'set -e; repo=$(pwd); tmp=$(mktemp -d); cd "$tmp"; cargo run --quiet --manifest-path "$repo/Cargo.toml" -- init; test -f hector.yaml; printf "custom: true\n" > hector.yaml; if cargo run --quiet --manifest-path "$repo/Cargo.toml" -- init >"$tmp/out" 2>"$tmp/err"; then echo "init should fail when hector.yaml exists"; exit 1; fi; grep -q "custom: true" hector.yaml; cargo run --quiet --manifest-path "$repo/Cargo.toml" -- init --force; grep -q "default_max_changed_files" hector.yaml'
+      - rg 'cargo install --path \.' README.md
+      - rg 'hector init' README.md
+      - rg 'hector.yaml' README.md
+      - rg 'hector mcp' README.md
+      - rg 'auto_commit.*clean' README.md
+      - rg 'config defaults' HECTOR_SPEC.md
+    editable_paths:
+      - README.md
+      - HECTOR_SPEC.md
+      - src/cli.rs
+      - src/main.rs
+    reference_paths:
+      - tests/check.rs
+      - Cargo.toml
+    judge_policy: retry_on_fail
+    max_iters: 4
+    max_changed_files: 4
+    max_changed_lines: 260
+
+  - name: compact-frontier-brief
+    task: Add a compact frontier handoff for lower-token orchestration.
+    spec: |
+      Add `hector frontier-brief --compact`. The default `frontier-brief`
+      output must stay unchanged. Compact output should be under 1200 bytes and
+      include the required handoff fields, `hector check` before Bob, and
+      `hector review` after Bob. This is for repeated frontier prompts where
+      the full brief is wasteful.
+    verify_cmds:
+      - cargo run --quiet -- frontier-brief > /tmp/hector-brief-full.txt
+      - rg 'Hector Frontier Brief' /tmp/hector-brief-full.txt
+      - cargo test frontier_brief_explains_handoff_contract
+      - |
+        bash -lc 'set -e; cargo run --quiet -- frontier-brief --compact > /tmp/hector-brief-compact.txt; test "$(wc -c < /tmp/hector-brief-compact.txt)" -le 1200; rg "verify_cmds" /tmp/hector-brief-compact.txt; rg "editable_paths" /tmp/hector-brief-compact.txt; rg "hector check" /tmp/hector-brief-compact.txt; rg "hector review" /tmp/hector-brief-compact.txt'
+    editable_paths:
+      - src/cli.rs
+      - src/main.rs
+      - src/guidance.rs
+    reference_paths:
+      - README.md
+      - HECTOR_SPEC.md
+      - tests/check.rs
+    judge_policy: retry_on_fail
+    max_iters: 4
+    max_changed_files: 4
+    max_changed_lines: 160

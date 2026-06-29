@@ -1,0 +1,32 @@
+builder:
+  cmd: opencode
+  timeout_secs: 180
+  model: qwen-193
+  models:
+    gemma-133: 192.168.1.133/cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit
+    qwen-193: ollama/Intel/Qwen3-Coder-Next-int4-AutoRound
+    glm:       zai-coding-plan/glm-5.2
+    minimax:   minimax-coding-plan/MiniMax-M3
+  fallback_models:
+    - gemma-133
+    - glm
+    - minimax
+  args: []
+judge:
+  cmd: abe
+  mode: validate
+  timeout_secs: 120
+  policy: advisory
+verify:
+  cmds:
+    - cargo test
+loop:
+  max_iterations: 2
+  max_walltime_secs: 600
+scope:
+  max_changed_files: 4
+  max_changed_lines: 220
+  allow_paths: []
+apply: false
+artifacts:
+  dir: .bob/runs
