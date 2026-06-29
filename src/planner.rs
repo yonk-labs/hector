@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
+use crate::conventions::Conventions;
+use crate::model::{self, ModelCfg};
+
 #[derive(Debug, Deserialize, Serialize)]
 struct Campaign {
     #[serde(default)]
@@ -100,6 +103,267 @@ pub fn plan(opts: PlanOptions) -> anyhow::Result<String> {
     Ok(yaml)
 }
 
+/// The model's response when asked to write a test and plan a slice.
+#[derive(Debug, Deserialize)]
+struct ModelPlanResponse {
+    test_code: String,
+    test_path: String,
+    verify_cmd: String,
+    editable_paths: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    reasoning: String,
+}
+
+/// Take the last `max` chars of a string (for error output truncation).
+fn tail_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let start = s.len() - max;
+    s[start..].to_string()
+}
+
+/// Distinguish "test file itself is broken" (import/syntax/module errors) from
+/// "feature isn't implemented yet" (assertion failures). Hector retries on
+/// infrastructure errors but accepts assertion failures as the correct RED state.
+fn is_infrastructure_error(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "cannot find module",
+        "is not a constructor",
+        "is not a function",
+        "is not defined",
+        "syntaxerror",
+        "unexpected token",
+        "cannot use import statement",
+        "err_require_module",
+        "err_module_not_found",
+        "referenceerror",
+        "module not found",
+        "no such file or directory",
+        "class extends value",
+    ];
+    // But NOT when it's clearly an assertion failure that happens to contain a keyword
+    if lower.contains("expect(received)") || lower.contains("assertion") {
+        return false;
+    }
+    PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+#[cfg(test)]
+mod infra_tests {
+    use super::is_infrastructure_error;
+
+    #[test]
+    fn detects_import_error() {
+        let out = "TypeError: Class extends value #<Object> is not a constructor or null\n\
+                   at Object.<anonymous> (tests/player.test.js:1:18)";
+        assert!(is_infrastructure_error(out));
+    }
+
+    #[test]
+    fn detects_module_not_found() {
+        let out = "Error: Cannot find module '../src/body'\nRequire stack:";
+        assert!(is_infrastructure_error(out));
+    }
+
+    #[test]
+    fn detects_syntax_error() {
+        let out = "SyntaxError: Unexpected token }";
+        assert!(is_infrastructure_error(out));
+    }
+
+    #[test]
+    fn does_not_flag_assertion_failure() {
+        let out = "expect(received).toBe(expected)\nExpected: 28\nReceived: 27";
+        assert!(!is_infrastructure_error(out));
+    }
+
+    #[test]
+    fn does_not_flag_test_failure_summary() {
+        let out = "FAIL tests/body.test.js\nTests: 1 failed, 7 passed";
+        assert!(!is_infrastructure_error(out));
+    }
+}
+
+const PLANNING_SYSTEM: &str = "\
+You are a TDD test-writer for a coding agent. The frontier model (or human) has already written a detailed behavior spec. Your job is to translate that spec into ONE focused failing test.\n\
+\n\
+Rules:\n\
+- Write ONLY the test. The spec is provided — do not change it.\n\
+- The test MUST fail before implementation (red state).\n\
+- Follow the repo's existing test conventions exactly.\n\
+- Match the API signature in the spec — constructor args, method names, param order, return types. The spec is the contract; your test exercises it.\n\
+- Write the MINIMAL test that proves the behavior — not a full suite. One test is usually enough.\n\
+- editable_paths are production files the implementation will change — never include test files there.\n\
+- Output ONLY valid JSON. No markdown fences. No prose before or after.\n\
+\n\
+Output schema:\n\
+{\"test_code\": \"full file contents\", \"test_path\": \"relative/path\", \"verify_cmd\": \"command\", \"editable_paths\": [\"paths\"], \"reasoning\": \"one sentence\"}";
+
+/// LLM-backed planning: the frontier model (or human) writes the spec, hector's
+/// smaller model writes a focused test against that spec. The spec is the
+/// contract; the test is the proof. Hector runs the red probe, freezes both
+/// into a campaign for bob to implement.
+pub async fn plan_with_model(
+    opts: PlanOptions,
+    cfg: &ModelCfg,
+    conventions: &Conventions,
+    repo_root: &Path,
+) -> anyhow::Result<String> {
+    if opts.task.trim().is_empty() {
+        anyhow::bail!("task is required for model-backed planning");
+    }
+    // Spec is REQUIRED in the LLM path. The frontier model is the spec author;
+    // hector only writes tests. Without a spec, we can't generate a meaningful
+    // test — refuse and ask for one rather than inventing both.
+    let spec = match opts.spec.as_deref() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => anyhow::bail!(
+            "--spec is required when using the LLM planning path. \
+             The frontier model (or human) writes the behavior contract; \
+             hector only writes the focused test against that contract. \
+             Provide a detailed spec file with API signatures, expected behavior, \
+             edge cases, and acceptance criteria."
+        ),
+    };
+
+    let user_prompt = format!(
+        "## TASK\n{task}\n\n\
+         ## SPEC (authoritative — write a test that exercises this exact behavior)\n{spec}\n\n\
+         ## REPO CONVENTIONS\n{conv}\n\n\
+         Write ONE focused test that proves the spec. Output JSON only.",
+        task = opts.task,
+        spec = spec,
+        conv = conventions.prompt_block(),
+    );
+
+    eprintln!("hector: asking model '{}' to write a focused test against the spec...", cfg.name);
+
+    // Retry loop: if the test has an infrastructure error (import/syntax/module),
+    // re-ask the model with the error. Distinguish from assertion failures (correct red).
+    // Hard caps to prevent infinite loop of doom:
+    //   max_retries = infra-error retries (model wrote a broken test)
+    //   loop_budget = absolute ceiling on total attempts (any failure type)
+    let max_retries = 2;
+    let loop_budget = 4; // hard ceiling: 1 initial + 2 infra retries + 1 spare
+    let mut attempt = 0;
+    let mut total_attempts = 0;
+    let mut current_prompt = user_prompt.clone();
+    let mut resp: ModelPlanResponse;
+
+    loop {
+        let raw = model::complete(cfg, PLANNING_SYSTEM, &current_prompt).await?;
+        let json_str = model::extract_json(&raw);
+        resp = serde_json::from_str(json_str)
+            .map_err(|e| anyhow::anyhow!("parse model plan response: {e}\nraw: {raw}"))?;
+
+        eprintln!("hector: model wrote test → {}", resp.test_path);
+
+        // Write the test file (hector owns test files; bob owns production code)
+        let test_path_full = repo_root.join(&resp.test_path);
+        if let Some(parent) = test_path_full.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&test_path_full, &resp.test_code)?;
+
+        // Red probe — run the verify command, confirm the test FAILS
+        eprintln!("hector: red probe — running '{}'", resp.verify_cmd);
+        let red_output = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&resp.verify_cmd)
+            .current_dir(repo_root)
+            .output()
+            .await;
+
+        let (is_red, output_text) = match red_output {
+            Ok(out) => {
+                let combined = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                (!out.status.success(), combined)
+            }
+            Err(e) => {
+                eprintln!("hector: warning — could not run verify command: {e}");
+                (false, e.to_string())
+            }
+        };
+
+        if !is_red {
+            eprintln!(
+                "hector: warning — test passed immediately (green). Either the feature exists or the test is wrong."
+            );
+            break;
+        }
+
+        // Test failed (red). But WHY? Infrastructure error vs assertion failure.
+        if is_infrastructure_error(&output_text) {
+            total_attempts += 1;
+            if attempt < max_retries && total_attempts <= loop_budget {
+                attempt += 1;
+                eprintln!(
+                    "hector: test has infrastructure error, retrying ({attempt}/{max_retries})..."
+                );
+                current_prompt = format!(
+                    "{initial}\n\n\
+                     ## PREVIOUS TEST HAD AN ERROR — FIX THIS\n\
+                     The test you wrote failed to load due to:\n{err}\n\n\
+                     Common fixes:\n\
+                     - Check require/import statements match module exports\n\
+                     - For CommonJS: use `const {{ X }} = require(...)` not `const X = require(...)`\n\
+                     - Verify file paths are correct (../src/ vs ./)\n",
+                    initial = user_prompt,
+                    err = tail_str(&output_text, 800)
+                );
+                continue;
+            }
+            eprintln!(
+                "hector: warning — test has infrastructure error after {max_retries} retries, accepting anyway"
+            );
+        } else {
+            eprintln!("hector: test fails as expected (red) ✓");
+        }
+        break;
+    }
+
+    // Freeze into campaign — spec from upstream is authoritative, test from hector
+    let name = opts.name.unwrap_or_else(|| slug(&opts.task));
+    let campaign = Campaign {
+        name: Some(name.clone()),
+        auto_commit: opts.auto_commit,
+        slices: vec![Slice {
+            name: Some(name),
+            task: Some(opts.task),
+            spec: Some(spec),
+            verify_cmds: Some(vec![resp.verify_cmd.clone()]),
+            editable_paths: if resp.editable_paths.is_empty() {
+                opts.editable_paths.clone()
+            } else {
+                resp.editable_paths
+            },
+            reference_paths: {
+                let mut refs = opts.reference_paths.clone();
+                let test_ref = resp.test_path.clone();
+                if !refs.contains(&test_ref) {
+                    refs.push(test_ref);
+                }
+                refs
+            },
+            judge_policy: Some(opts.judge_policy),
+            max_iters: Some(opts.max_iters),
+            max_changed_files: Some(opts.max_changed_files),
+            max_changed_lines: Some(opts.max_changed_lines),
+        }],
+    };
+
+    let yaml = serde_yaml::to_string(&campaign)?;
+    check_text(&yaml)?;
+    Ok(yaml)
+}
+
 pub fn check(path: &Path) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(path)?;
     check_text(&content)
@@ -183,6 +447,102 @@ pub fn review(campaign_path: &Path, bob_result_path: &Path) -> anyhow::Result<St
     let campaign = std::fs::read_to_string(campaign_path)?;
     let bob_result = std::fs::read_to_string(bob_result_path)?;
     review_text(&campaign, &bob_result)
+}
+
+/// Tier 2 deep review: call abe validate with a frontier reviewer (codex/glm)
+/// for a final quality gate before handing results to the frontier model.
+/// Runs ONCE per slice — not per iteration. The cheap per-iteration review
+/// (bob's judge) already caught obvious bugs; this is the "are we really sure?"
+/// check with a strong model.
+pub async fn deep_review(
+    campaign_path: &Path,
+    bob_result_path: &Path,
+    reviewer: &str,
+) -> anyhow::Result<String> {
+    let campaign = std::fs::read_to_string(campaign_path)?;
+    let bob_result = std::fs::read_to_string(bob_result_path)?;
+
+    // Extract spec + diff from the campaign and bob result for the reviewer
+    let campaign_yaml: Campaign = serde_yaml::from_str(&campaign)?;
+    let result: BobResult = serde_json::from_str(&bob_result)?;
+
+    let spec = campaign_yaml
+        .slices
+        .iter()
+        .filter_map(|s| s.spec.as_deref())
+        .next()
+        .unwrap_or("(no spec)");
+
+    let diff = result
+        .slices
+        .iter()
+        .filter_map(|s| s.status.as_deref())
+        .next()
+        .unwrap_or("");
+
+    let statement = format!(
+        "Deep code review. This code passed automated tests and a cheap reviewer. \
+         As a frontier reviewer, check for subtle issues the cheap reviewer might miss: \
+         race conditions, security holes, performance traps, semantic errors, \
+         and spec violations that tests don't cover.\n\n\
+         ## SPEC\n{spec}\n\n## BUILD STATUS\n{diff}\n\n## BOB RESULT\n{bob_result}"
+    );
+
+    eprintln!("hector: deep review with '{reviewer}'...");
+    let output = tokio::process::Command::new("abe")
+        .args([
+            "validate",
+            "--reviewer",
+            reviewer,
+            "--json",
+            "--",
+            &statement,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("spawning abe for deep review: {e}"))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "abe deep review failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| anyhow::anyhow!("abe returned non-JSON: {e}"))?;
+
+    let take = v
+        .get("take")
+        .and_then(|t| t.as_str())
+        .unwrap_or("(no review output)");
+
+    // Classify: does the deep reviewer have concerns?
+    let has_concerns = take
+        .to_lowercase()
+        .contains("bug")
+        || take.to_lowercase().contains("issue")
+        || take.to_lowercase().contains("concern")
+        || take.to_lowercase().contains("violation")
+        || take.to_lowercase().contains("should")
+        || take.to_lowercase().contains("fix");
+
+    let verdict = if has_concerns {
+        "accept_for_human_review"
+    } else {
+        "accept"
+    };
+
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "deep_verdict": verdict,
+        "deep_reviewer": reviewer,
+        "deep_take": take,
+    }))?)
 }
 
 pub fn review_text(campaign_text: &str, bob_result_text: &str) -> anyhow::Result<String> {

@@ -18,20 +18,45 @@ Hector does not write production code. Its job is to make the implementation tas
 - freeze Bob's editable paths and scope caps
 - review Bob's result against the original contract
 
-## Quick Start
+## Install And Setup
 
 ```sh
-cargo run -- frontier-brief
-cargo run -- plan \
+cargo install --path .
+hector init
+hector frontier-brief
+hector plan \
   --task "Add a focused Bob slice" \
   --verify "cargo test focused_slice" \
   --editable-path src/lib.rs \
   --reference-path tests/focused_slice.rs \
   --out campaign.yaml
-cargo run -- check --file campaign.yaml
-cargo run -- review --campaign campaign.yaml --bob-result result.json
-cargo run -- mcp
+hector check --file campaign.yaml
+bob campaign --file campaign.yaml
+hector review --campaign campaign.yaml --bob-result result.json
+hector mcp
 ```
+
+`hector init` writes a starter `hector.yaml`. If the file already exists,
+Hector refuses to overwrite it unless you pass `hector init --force`.
+
+`hector.yaml` supplies config defaults for `hector plan`:
+
+```yaml
+scope:
+  default_max_changed_files: 2
+  default_max_changed_lines: 160
+judge:
+  default_policy: retry_on_fail
+bob:
+  campaign_auto_commit: true
+```
+
+CLI flags override config defaults. `--no-auto-commit` always wins.
+
+In a Hector context, "run it" means run `hector check` and the repo tests.
+Do not run Bob unless implementation or campaign execution is explicitly
+requested. For Bob multi-slice campaigns, `auto_commit: true` requires a clean
+checkout; stop on a dirty tree or run Bob from a clean throwaway worktree.
 
 `frontier-brief` prints the exact contract frontier models should follow when asking Hector for a campaign. The same text is also exposed as a repo skill at [skills/hector-frontier/SKILL.md](skills/hector-frontier/SKILL.md).
 
@@ -40,7 +65,9 @@ cargo run -- mcp
 - `hector plan` emits Bob-compatible campaign YAML, or `needs_input` JSON when required proof/scope is missing.
 - `hector check` statically rejects weak or dangerous campaigns before Bob sees them.
 - `hector review` compares Bob's result JSON against the original campaign and returns `accept`, `accept_for_human_review`, `revise_campaign`, `split_task`, or `ask_human`.
-- `hector frontier-brief` gives orchestrators a compact handoff prompt.
+- `hector frontier-brief` gives orchestrators the full handoff prompt.
+- `hector frontier-brief --compact` gives orchestrators a low-token handoff.
+- `hector init` writes a starter `hector.yaml`.
 - `hector mcp` exposes `frontier_brief`, `plan_campaign`, `check_campaign`, and `review_result` over stdio MCP.
 
 ## Campaign Shape

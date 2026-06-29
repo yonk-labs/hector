@@ -1,0 +1,22 @@
+verify:
+  prefer_focused: true
+scope:
+  forbid_dependency_churn: true
+  default_max_changed_files: 2
+  default_max_changed_lines: 160
+judge:
+  default_policy: retry_on_fail
+bob:
+  campaign_auto_commit: true
+models:
+  - { name: qwen,    model: "Intel/Qwen3-Coder-Next-int4-AutoRound", base_url: "http://192.168.1.193:8000/v1" }
+  - { name: gemma,   model: "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit", base_url: "http://192.168.1.133:8000/v1" }
+  - { name: minimax, model: "MiniMax-M3", base_url: "https://api.minimax.io/v1", api_key_env: MINIMAX_API_KEY }
+default_model: qwen
+review:
+  # Tier 2: expensive frontier reviewer for final quality gate.
+  # Runs once per slice (after bob converges + hector's deterministic review).
+  # The cheap per-iteration review (bob's judge: qwen/gemma) already caught
+  # obvious bugs. This is the "are we really sure?" check before handing to frontier.
+  deep_reviewer: codex
+  deep_on_accept: false  # set true to auto-run; use --deep to force per call

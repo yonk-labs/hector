@@ -5,17 +5,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn tmp_file(name: &str, body: &str) -> std::path::PathBuf {
+    let dir = tmp_dir("hector-check");
+    let path = dir.join(name);
+    fs::write(&path, body).unwrap();
+    path
+}
+
+fn tmp_dir(prefix: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "hector-check-{}-{:?}-{}",
+        "{prefix}-{}-{:?}-{}",
         std::process::id(),
         std::thread::current().id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(name);
-    fs::write(&path, body).unwrap();
-    path
+    dir
 }
 
 fn hector_check(body: &str) -> std::process::Output {
@@ -29,6 +34,14 @@ fn hector_check(body: &str) -> std::process::Output {
 
 fn hector(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_hector"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn hector_in(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_hector"))
+        .current_dir(dir)
         .args(args)
         .output()
         .unwrap()
@@ -212,7 +225,8 @@ slices:
 
 #[test]
 fn plan_needs_input_without_verify_or_editable_paths() {
-    let out = hector(&["plan", "--task", "Add a useful behavior"]);
+    let dir = tmp_dir("plan-needs-input");
+    let out = hector_in(&dir, &["plan", "--task", "Add a useful behavior"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("\"status\": \"needs_input\""));
@@ -394,4 +408,111 @@ fn frontier_brief_explains_handoff_contract() {
     assert!(stdout.contains("hector plan"));
     assert!(stdout.contains("editable_paths"));
     assert!(stdout.contains("needs_input"));
+}
+
+#[test]
+fn compact_frontier_brief_is_short_and_actionable() {
+    let out = hector(&["frontier-brief", "--compact"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.len() <= 1200);
+    assert!(stdout.contains("verify_cmds"));
+    assert!(stdout.contains("editable_paths"));
+    assert!(stdout.contains("hector check"));
+    assert!(stdout.contains("hector review"));
+}
+
+#[test]
+fn init_refuses_existing_config_unless_forced() {
+    let dir = tmp_dir("hector-init");
+    let first = hector_in(&dir, &["init"]);
+    assert!(first.status.success());
+    fs::write(dir.join("hector.yaml"), "custom: true\n").unwrap();
+
+    let refused = hector_in(&dir, &["init"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--force"));
+    assert_eq!(
+        fs::read_to_string(dir.join("hector.yaml")).unwrap(),
+        "custom: true\n"
+    );
+
+    let forced = hector_in(&dir, &["init", "--force"]);
+    assert!(forced.status.success());
+    assert!(fs::read_to_string(dir.join("hector.yaml"))
+        .unwrap()
+        .contains("default_max_changed_files"));
+}
+
+#[test]
+fn plan_uses_config_defaults_and_cli_overrides() {
+    let dir = tmp_dir("hector-config");
+    fs::write(
+        dir.join("hector.yaml"),
+        "scope:\n  default_max_changed_files: 1\n  default_max_changed_lines: 77\njudge:\n  default_policy: ask_human\nbob:\n  campaign_auto_commit: false\n",
+    )
+    .unwrap();
+
+    let out = hector_in(
+        &dir,
+        &[
+            "plan",
+            "--task",
+            "Use config defaults.",
+            "--verify",
+            "true",
+            "--editable-path",
+            "src/lib.rs",
+        ],
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("auto_commit: false"));
+    assert!(stdout.contains("max_changed_files: 1"));
+    assert!(stdout.contains("max_changed_lines: 77"));
+    assert!(stdout.contains("judge_policy: ask_human"));
+
+    let override_out = hector_in(
+        &dir,
+        &[
+            "plan",
+            "--task",
+            "Override config defaults.",
+            "--verify",
+            "true",
+            "--editable-path",
+            "src/lib.rs",
+            "--max-changed-files",
+            "3",
+            "--max-changed-lines",
+            "88",
+            "--judge-policy",
+            "retry_on_fail",
+        ],
+    );
+    assert!(override_out.status.success());
+    let stdout = String::from_utf8_lossy(&override_out.stdout);
+    assert!(stdout.contains("max_changed_files: 3"));
+    assert!(stdout.contains("max_changed_lines: 88"));
+    assert!(stdout.contains("judge_policy: retry_on_fail"));
+}
+
+#[test]
+fn plan_reports_bad_hector_yaml() {
+    let dir = tmp_dir("hector-bad-config");
+    fs::write(dir.join("hector.yaml"), "scope: [").unwrap();
+    let out = hector_in(
+        &dir,
+        &[
+            "plan",
+            "--task",
+            "Bad config.",
+            "--verify",
+            "true",
+            "--editable-path",
+            "src/lib.rs",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("hector.yaml"));
 }

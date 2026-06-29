@@ -85,3 +85,12 @@ Return `needs_input` with `human_questions` when:
 
 Run `hector check` before Bob. Ask Abe before Bob when the slice is broad, multi-file, touches tests, permits dependencies, or has ambiguous acceptance criteria. After Bob runs, use `hector review` and reject results that edit files outside `editable_paths`, touch dependency files unexpectedly, exceed scope caps, or ask for `split_task`.
 "#;
+
+pub const COMPACT_FRONTIER_BRIEF: &str = r#"# Hector Compact Brief
+
+Give Hector one Bob-sized slice with: task, spec, verify_cmds, editable_paths, reference_paths, max_changed_files, max_changed_lines, dependency_policy, and review_policy.
+
+Use one deterministic proof per behavior. Freeze tests/specs as reference-only. Run `hector check --file campaign.yaml` before Bob, then `bob campaign --file campaign.yaml`, then `hector review --campaign campaign.yaml --bob-result result.json`.
+
+Ask Abe before Bob for broad, multi-file, dependency, or ambiguous slices. Ask a human when behavior or proof is unclear.
+"#;

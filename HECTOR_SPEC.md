@@ -83,7 +83,9 @@ hector mcp
 
 `frontier-brief` prints the contract frontier orchestrators should follow when writing Hector-ready slices.
 
-`init` writes a starter `hector.yaml`.
+`frontier-brief --compact` prints a low-token version for repeated orchestration prompts.
+
+`init` writes a starter `hector.yaml`. It refuses to overwrite an existing file unless `--force` is passed.
 
 `mcp` exposes the same operations to a frontier orchestrator.
 
@@ -246,6 +248,8 @@ Hector returns `human_questions` instead of slices when:
 - the slice needs dependency churn that the user did not explicitly allow
 
 ## Config
+
+Config values are config defaults consumed by the CLI. Per-command flags override them, and `--no-auto-commit` always forces `auto_commit: false`.
 
 `hector.yaml`:
 

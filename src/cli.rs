@@ -31,17 +31,17 @@ pub enum Command {
         #[arg(long = "reference-path")]
         reference_paths: Vec<String>,
         /// Max changed files cap.
-        #[arg(long, default_value_t = 2)]
-        max_changed_files: u64,
+        #[arg(long)]
+        max_changed_files: Option<u64>,
         /// Max changed lines cap.
-        #[arg(long, default_value_t = 160)]
-        max_changed_lines: u64,
+        #[arg(long)]
+        max_changed_lines: Option<u64>,
         /// Max Bob iterations.
         #[arg(long, default_value_t = 4)]
         max_iters: u32,
         /// Judge policy for Bob.
-        #[arg(long, default_value = "retry_on_fail")]
-        judge_policy: String,
+        #[arg(long)]
+        judge_policy: Option<String>,
         /// Disable campaign auto_commit.
         #[arg(long)]
         no_auto_commit: bool,
@@ -63,16 +63,26 @@ pub enum Command {
         /// Bob result JSON file.
         #[arg(long = "bob-result")]
         bob_result: PathBuf,
+        /// Force deep (expensive) review with the frontier reviewer.
+        #[arg(long)]
+        deep: bool,
     },
     /// Print instructions for frontier models writing Hector-ready slices.
     #[command(alias = "brief", alias = "prompt")]
     FrontierBrief {
+        /// Print the short low-token handoff.
+        #[arg(long)]
+        compact: bool,
         /// Optional output path.
         #[arg(long)]
         out: Option<PathBuf>,
     },
     /// Write starter hector.yaml.
-    Init,
+    Init {
+        /// Overwrite an existing hector.yaml.
+        #[arg(long)]
+        force: bool,
+    },
     /// Run the stdio MCP server.
     Mcp,
 }
