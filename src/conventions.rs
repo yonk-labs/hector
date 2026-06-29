@@ -75,8 +75,8 @@ fn js_conv(runner: &str, cmd: &str) -> Conventions {
 impl Conventions {
     pub fn prompt_block(&self) -> String {
         format!(
-            "- Language: {}\n- Test runner: {}\n- Test directory: {}\n- Test file pattern: {}",
-            self.language, self.test_runner, self.test_dir, self.test_pattern
+            "- Language: {}\n- Test runner: {}\n- Test directory: {}\n- Test file pattern: {}\n- Test file extension: {}",
+            self.language, self.test_runner, self.test_dir, self.test_pattern, self.test_file_ext
         )
     }
 }

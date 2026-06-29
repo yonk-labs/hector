@@ -10,38 +10,7 @@ use std::path::{Component, Path};
 
 use crate::conventions::Conventions;
 use crate::model::{self, ModelCfg};
-
-#[derive(Debug, Deserialize, Serialize)]
-struct Campaign {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    auto_commit: bool,
-    slices: Vec<Slice>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct Slice {
-    #[serde(default)]
-    name: Option<String>,
-    task: Option<String>,
-    #[serde(default)]
-    spec: Option<String>,
-    #[serde(default)]
-    verify_cmds: Option<Vec<String>>,
-    #[serde(default)]
-    editable_paths: Vec<String>,
-    #[serde(default)]
-    reference_paths: Vec<String>,
-    #[serde(default)]
-    judge_policy: Option<String>,
-    #[serde(default)]
-    max_iters: Option<u32>,
-    #[serde(default)]
-    max_changed_files: Option<u64>,
-    #[serde(default)]
-    max_changed_lines: Option<u64>,
-}
+use crate::schema::{Campaign, Slice};
 
 pub struct PlanOptions {
     pub task: String,
@@ -96,6 +65,7 @@ pub fn plan(opts: PlanOptions) -> anyhow::Result<String> {
             max_iters: Some(opts.max_iters),
             max_changed_files: Some(opts.max_changed_files),
             max_changed_lines: Some(opts.max_changed_lines),
+            tier: None,
         }],
     };
     let yaml = serde_yaml::to_string(&campaign)?;
@@ -116,12 +86,12 @@ struct ModelPlanResponse {
 }
 
 /// Take the last `max` chars of a string (for error output truncation).
+/// Char-based, not byte-based, so multibyte UTF-8 output can't panic on a
+/// non-boundary slice.
 fn tail_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let start = s.len() - max;
-    s[start..].to_string()
+    let mut chars: Vec<char> = s.chars().rev().take(max).collect();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 /// Distinguish "test file itself is broken" (import/syntax/module errors) from
@@ -184,6 +154,18 @@ mod infra_tests {
     fn does_not_flag_test_failure_summary() {
         let out = "FAIL tests/body.test.js\nTests: 1 failed, 7 passed";
         assert!(!is_infrastructure_error(out));
+    }
+
+    #[test]
+    fn tail_str_is_utf8_safe_and_bounded() {
+        use super::tail_str;
+        // Multibyte input longer than max: byte-slicing would panic mid-char.
+        let s = "é".repeat(500);
+        let out = tail_str(&s, 100);
+        assert_eq!(out.chars().count(), 100);
+        assert!(out.chars().all(|c| c == 'é'));
+        // Shorter than max: returned whole.
+        assert_eq!(tail_str("hi", 100), "hi");
     }
 }
 
@@ -356,6 +338,7 @@ pub async fn plan_with_model(
             max_iters: Some(opts.max_iters),
             max_changed_files: Some(opts.max_changed_files),
             max_changed_lines: Some(opts.max_changed_lines),
+            tier: None,
         }],
     };
 
@@ -422,6 +405,8 @@ struct BobResult {
     #[serde(default)]
     changed_files: Vec<String>,
     #[serde(default)]
+    final_diff: Option<String>,
+    #[serde(default)]
     slices: Vec<BobSliceResult>,
 }
 
@@ -435,6 +420,8 @@ struct BobSliceResult {
     stop_reason: Option<String>,
     #[serde(default)]
     changed_files: Vec<String>,
+    #[serde(default)]
+    final_diff: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -473,28 +460,39 @@ pub async fn deep_review(
         .next()
         .unwrap_or("(no spec)");
 
+    // The actual code under review is bob's final_diff (top-level or per-slice),
+    // NOT the status string. Fall back to a note if bob produced no diff.
     let diff = result
-        .slices
-        .iter()
-        .filter_map(|s| s.status.as_deref())
-        .next()
-        .unwrap_or("");
+        .final_diff
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+        .or_else(|| {
+            result
+                .slices
+                .iter()
+                .filter_map(|s| s.final_diff.as_deref())
+                .find(|d| !d.trim().is_empty())
+        })
+        .unwrap_or("(no diff in bob result)");
 
     let statement = format!(
         "Deep code review. This code passed automated tests and a cheap reviewer. \
          As a frontier reviewer, check for subtle issues the cheap reviewer might miss: \
          race conditions, security holes, performance traps, semantic errors, \
          and spec violations that tests don't cover.\n\n\
-         ## SPEC\n{spec}\n\n## BUILD STATUS\n{diff}\n\n## BOB RESULT\n{bob_result}"
+         ## SPEC\n{spec}\n\n## DIFF UNDER REVIEW\n{diff}"
     );
 
     eprintln!("hector: deep review with '{reviewer}'...");
+    // --verdict: abe returns a structured {verdict, reasons, take} instead of
+    // prose, so the gate reads a field rather than keyword-grepping the review.
     let output = tokio::process::Command::new("abe")
         .args([
             "validate",
             "--reviewer",
             reviewer,
             "--json",
+            "--verdict",
             "--",
             &statement,
         ])
@@ -521,26 +519,26 @@ pub async fn deep_review(
         .get("take")
         .and_then(|t| t.as_str())
         .unwrap_or("(no review output)");
+    let reasons: Vec<String> = v
+        .get("reasons")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().filter_map(|i| i.as_str().map(String::from)).collect())
+        .unwrap_or_default();
 
-    // Classify: does the deep reviewer have concerns?
-    let has_concerns = take
-        .to_lowercase()
-        .contains("bug")
-        || take.to_lowercase().contains("issue")
-        || take.to_lowercase().contains("concern")
-        || take.to_lowercase().contains("violation")
-        || take.to_lowercase().contains("should")
-        || take.to_lowercase().contains("fix");
-
-    let verdict = if has_concerns {
-        "accept_for_human_review"
-    } else {
-        "accept"
+    // Gate on abe's structured verdict. A missing/unknown verdict reads as
+    // "uncertain" (never a silent pass) → route to human. Only an explicit
+    // "pass" auto-accepts.
+    let reviewer_verdict = v.get("verdict").and_then(|x| x.as_str()).unwrap_or("uncertain");
+    let decision = match reviewer_verdict {
+        "pass" => "accept",
+        _ => "accept_for_human_review", // fail or uncertain → a human looks
     };
 
     Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "deep_verdict": verdict,
+        "deep_verdict": decision,
+        "reviewer_verdict": reviewer_verdict,
         "deep_reviewer": reviewer,
+        "deep_reasons": reasons,
         "deep_take": take,
     }))?)
 }
@@ -651,14 +649,20 @@ fn is_unsafe_path(path: &str) -> bool {
     p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir))
 }
 
+/// Test-file heuristic. MUST stay in sync with bob's `engine::is_test_path` —
+/// a file one tool treats as a frozen test and the other as editable production
+/// code is a scope hole across the seam. (Pinned by is_test_path_matches_bob.)
 fn is_test_path(path: &str) -> bool {
     let p = Path::new(path);
-    p.components()
-        .any(|c| matches!(c, Component::Normal(s) if s == "tests" || s == "test"))
-        || path.ends_with("_test.rs")
+    p.components().any(
+        |c| matches!(c, Component::Normal(s) if s == "tests" || s == "test" || s == "__tests__"),
+    ) || path.ends_with("_test.rs")
+        || path.ends_with("_test.js")
+        || path.ends_with("_test.py")
         || path.ends_with(".test.js")
-        || path.ends_with(".spec.js")
         || path.ends_with(".test.ts")
+        || path.ends_with(".spec.js")
+        || path.ends_with(".spec.ts")
 }
 
 fn is_dependency_file(path: &str) -> bool {
@@ -692,5 +696,59 @@ fn slug(s: &str) -> String {
         "campaign".into()
     } else {
         out.chars().take(40).collect()
+    }
+}
+
+#[cfg(test)]
+mod review_contract_tests {
+    use super::review_text;
+
+    // CROSS-REPO CONTRACT: bob's exact JSON strings (bob/src/report.rs::to_json)
+    // that review_text routes on. If bob renames a RunStatus/NextAction/StopReason
+    // variant, bob's cross_repo_status_string_contract test fails first; this side
+    // pins that review_text still maps those strings to the right decision.
+    const CAMPAIGN: &str = "name: c\nslices:\n  - task: t\n    verify_cmds: [x]\n    editable_paths: [src/a.rs]\n    max_changed_files: 1\n    max_changed_lines: 9\n";
+
+    fn decision(bob_json: &str) -> String {
+        review_text(CAMPAIGN, bob_json).unwrap()
+    }
+
+    #[test]
+    fn next_action_split_task_routes_to_split() {
+        let j = r#"{"status":"not_converged","next_action":"split_task","changed_files":[]}"#;
+        assert!(decision(j).contains("split_task"), "{}", decision(j));
+    }
+
+    #[test]
+    fn stop_reason_scopeexceeded_routes_to_split() {
+        let j = r#"{"status":"not_converged","stop_reason":"ScopeExceeded","changed_files":[]}"#;
+        assert!(decision(j).contains("split_task"), "{}", decision(j));
+    }
+
+    #[test]
+    fn converged_clean_routes_to_accept() {
+        let j = r#"{"status":"converged","next_action":"done","changed_files":["src/a.rs"]}"#;
+        assert!(decision(j).contains("accept"), "{}", decision(j));
+    }
+
+    #[test]
+    fn needs_review_routes_to_human() {
+        let j = r#"{"status":"needs_review","next_action":"review_candidate","changed_files":["src/a.rs"]}"#;
+        assert!(decision(j).contains("accept_for_human_review"), "{}", decision(j));
+    }
+
+    // CROSS-REPO CONTRACT: must match bob::engine::is_test_path exactly.
+    #[test]
+    fn is_test_path_matches_bob() {
+        use super::is_test_path;
+        for p in [
+            "tests/a.rs", "test/a.rs", "__tests__/a.js", "a_test.rs", "a_test.js",
+            "a_test.py", "a.test.js", "a.test.ts", "a.spec.js", "a.spec.ts",
+        ] {
+            assert!(is_test_path(p), "should be a test path: {p}");
+        }
+        for p in ["src/main.rs", "src/foo.js", "lib/util.py"] {
+            assert!(!is_test_path(p), "should NOT be a test path: {p}");
+        }
     }
 }

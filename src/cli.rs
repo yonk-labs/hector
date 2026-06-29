@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "hector", about = "TDD slice planner for Bob campaigns")]
+#[command(name = "hector", version, about = "TDD slice planner for Bob campaigns")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -95,6 +95,10 @@ pub enum Command {
         /// Bob binary path (default: "bob" on PATH).
         #[arg(long)]
         bob_cmd: Option<String>,
+        /// Build + combined-verify in a throwaway worktree and write the merged
+        /// diff for inspection — do NOT modify the working tree.
+        #[arg(long)]
+        propose: bool,
     },
     /// Run the stdio MCP server.
     Mcp,

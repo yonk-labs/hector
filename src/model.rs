@@ -110,11 +110,6 @@ pub fn extract_json(text: &str) -> &str {
     }
 }
 
-/// Rough token estimate (~4 chars/token). Same heuristic abe uses.
-pub fn est_tokens(s: &str) -> usize {
-    (s.len() / 4).max(1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,11 +124,5 @@ mod tests {
     fn extract_json_finds_object_in_prose() {
         let input = "Here is the plan:\n{\"a\": 1, \"b\": [2]}\nThat's it.";
         assert_eq!(extract_json(input), r#"{"a": 1, "b": [2]}"#);
-    }
-
-    #[test]
-    fn est_tokens_basic() {
-        assert!(est_tokens("hello world this is a test") >= 6);
-        assert_eq!(est_tokens(""), 1);
     }
 }

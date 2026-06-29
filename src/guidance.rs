@@ -2,7 +2,9 @@ pub const FRONTIER_BRIEF: &str = r#"# Hector Frontier Brief
 
 You are the frontier orchestrator. Your job is to turn product intent into Hector-ready slices that Bob can implement cheaply and safely.
 
-Hector is looking for executable proof, not broad intent. Each slice must describe the smallest observable behavior a deterministic command can prove. Bob implements production code. Hector freezes the test/spec and editable scope. Abe or a human reviews ambiguous results.
+Hector is looking for executable proof, not broad intent. Each slice must describe the smallest observable behavior a deterministic command can prove. Bob implements production code. Hector freezes the test/spec and editable scope.
+
+The **deterministic verify gate is the authority** — it decides pass/fail. Abe is a *reviewer*, not the gate: a single-LLM `abe validate --verdict` (light) is the default second opinion, run sparingly (e.g. once per slice at `hector deep-review`, or per-iteration as a non-blocking advisory). Reserve the multi-LLM `abe debate` (heavy) for high-stakes or genuinely ambiguous slices. A human reviews when behavior or proof is unclear.
 
 ## Give Hector This
 
@@ -83,7 +85,7 @@ Return `needs_input` with `human_questions` when:
 
 ## Bob/Abe Guardrails
 
-Run `hector check` before Bob. Ask Abe before Bob when the slice is broad, multi-file, touches tests, permits dependencies, or has ambiguous acceptance criteria. After Bob runs, use `hector review` and reject results that edit files outside `editable_paths`, touch dependency files unexpectedly, exceed scope caps, or ask for `split_task`.
+Run `hector check` before Bob (deterministic — no LLM). Ask Abe (single-LLM `validate --verdict`) before Bob when the slice is broad, multi-file, touches tests, permits dependencies, or has ambiguous acceptance criteria — abe is heavy in debate mode, so keep it sparing. After Bob runs, use `hector review` (deterministic scope/dependency check) and reject results that edit files outside `editable_paths`, touch dependency files unexpectedly, exceed scope caps, or ask for `split_task`; use `hector deep-review` for a single-LLM verdict on the diff when you want a second opinion before accepting.
 "#;
 
 pub const COMPACT_FRONTIER_BRIEF: &str = r#"# Hector Compact Brief

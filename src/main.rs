@@ -6,6 +6,7 @@ mod guidance;
 mod mcp;
 mod model;
 mod planner;
+mod schema;
 
 use clap::Parser;
 use cli::{Cli, Command};
@@ -38,15 +39,11 @@ async fn main() -> anyhow::Result<()> {
 // hector's model writes a focused test against the provided --spec.
 // The spec (from the frontier model or human) is the authoritative contract.
 // Otherwise, the deterministic path is used.
-if verify_cmds.iter().all(|c| c.trim().is_empty()) {
-    if spec_text.is_none() {
-        anyhow::bail!(
-            "--spec is required when using the LLM planning path (no --verify given). \
-             The frontier model writes the behavior contract; hector only writes the test against it. \
-             Either provide a detailed --spec file, or use the deterministic path by passing \
-             --verify, --editable-path explicitly."
-        );
-    }
+// LLM planning path: a --spec is provided but no --verify, so hector writes the
+// focused test against the spec. Without a spec we fall through to the
+// deterministic planner, which returns friendly needs_input guidance rather than
+// hard-erroring — `hector plan --task X` should tell the user what's missing.
+if verify_cmds.iter().all(|c| c.trim().is_empty()) && spec_text.is_some() {
     let model_cfg = config::load_default_model()?;
     if let Some(cfg) = model_cfg {
         let repo_root = std::env::current_dir()?;
@@ -166,8 +163,10 @@ if verify_cmds.iter().all(|c| c.trim().is_empty()) {
             std::fs::write(path, config::DEFAULT_CONFIG)?;
             Ok(())
         }
-        Command::Dispatch { file, jobs, bob_cmd } => {
-            let report = dispatch::run_campaign(&file, jobs, bob_cmd.as_deref().unwrap_or("bob")).await?;
+        Command::Dispatch { file, jobs, bob_cmd, propose } => {
+            let report =
+                dispatch::run_campaign(&file, jobs, bob_cmd.as_deref().unwrap_or("bob"), propose)
+                    .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
