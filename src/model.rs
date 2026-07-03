@@ -114,18 +114,31 @@ pub fn extract_json(text: &str) -> String {
 
 /// Remove `<think>...</think>` reasoning blocks (MiniMax-M3 and friends wrap
 /// their answer in them, and the reasoning often contains `{`/`}` that fool
-/// the brace scan). An unclosed `<think>` means the answer never arrived —
-/// everything after it is reasoning, so it's dropped.
+/// the brace scan). Two asymmetric cases matter:
+///   - unclosed `<think>`: the answer never arrived — everything after the
+///     tag is reasoning, dropped;
+///   - orphan `</think>` with no opening tag: some chat templates put the
+///     opening `<think>` in the PROMPT, so the completion is reasoning that
+///     just ends with `</think>` — everything before it is reasoning, dropped.
 fn strip_think_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(open) = rest.find("<think>") {
-        out.push_str(&rest[..open]);
-        match rest[open..].find("</think>") {
-            Some(close) => rest = &rest[open + close + "</think>".len()..],
-            None => {
-                rest = "";
+    loop {
+        let open = rest.find("<think>");
+        let close = rest.find("</think>");
+        match (open, close) {
+            // Closing tag first (orphan): what precedes it is reasoning.
+            (Some(o), Some(c)) if c < o => rest = &rest[c + "</think>".len()..],
+            (None, Some(c)) => rest = &rest[c + "</think>".len()..],
+            // Opening tag first: keep what precedes it, drop the block.
+            (Some(o), _) => {
+                out.push_str(&rest[..o]);
+                match rest[o..].find("</think>") {
+                    Some(c) => rest = &rest[o + c + "</think>".len()..],
+                    None => rest = "",
+                }
             }
+            (None, None) => break,
         }
     }
     out.push_str(rest);
@@ -139,8 +152,14 @@ fn strip_think_blocks(text: &str) -> String {
 /// newlines — split on both. Any non-trivial segment repeated ≥8 times means
 /// the response is garbage — fail fast and rotate models instead of parsing a
 /// truncated tail.
+///
+/// Judged on the ANSWER, not the reasoning: think blocks are stripped first,
+/// because a reasoning model legitimately re-quotes the same line while
+/// ruminating. A loop entirely inside an unclosed think block strips to
+/// nothing and fails as a parse error instead — same rotation, right label.
 /// ponytail: delimiter-split repeat count; add n-gram scan if models loop without separators.
-pub fn is_looping_output(text: &str) -> bool {
+pub fn is_looping_output(raw: &str) -> bool {
+    let text = strip_think_blocks(raw);
     let mut counts: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
     let segments = text
         .lines()
@@ -191,6 +210,29 @@ mod tests {
     }
 
     #[test]
+    fn extract_json_handles_real_minimax_m3_response() {
+        // Verbatim MiniMax-M3 completion captured live 2026-07-03 (trimmed
+        // mid-reasoning): quoted JSON keys and paths inside the think block,
+        // answer after it.
+        let real = "<think>The user wants a JSON object with two keys: \"test_path\" and \"verify_cmd\". This is for a vitest test of a function `clamp(x, lo, hi)`.\n\nLet me think about reasonable values:\n- test_path: a path to a test file, e.g., \"./tests/clamp.test.js\" or \"src/__tests__/clamp.test.js\"\n\nLet me provide a reasonable, common convention.</think>\n\n{\"test_path\":\"tests/clamp.test.js\",\"verify_cmd\":\"npx vitest run tests/clamp.test.js\"}";
+        let json = extract_json(real);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["test_path"], "tests/clamp.test.js");
+    }
+
+    #[test]
+    fn extract_json_handles_orphan_closing_tag() {
+        // R1-style templates put the opening <think> in the PROMPT: the
+        // completion is reasoning (with braces!) ending in </think>, then
+        // the answer — no opening tag anywhere in the response.
+        let input = "Let me weigh {option: 1} vs {option: 2}...</think>\n{\"a\": 1}";
+        assert_eq!(extract_json(input), r#"{"a": 1}"#);
+        // Orphan close then a normal closed pair later.
+        let input = "reasoning {x}</think>{\"a\": 2}<think>post-hoc {y}</think>";
+        assert_eq!(extract_json(input), r#"{"a": 2}"#);
+    }
+
+    #[test]
     fn looping_output_detected() {
         let looped = "I'll use the 'fed' case here.\n".repeat(30);
         assert!(is_looping_output(&looped));
@@ -199,6 +241,25 @@ mod tests {
         assert!(!is_looping_output(&"distinct line one\n".repeat(3)));
         // Trivial short lines (blank, braces) repeat legitimately.
         assert!(!is_looping_output(&"}\n\n{\n".repeat(40)));
+    }
+
+    #[test]
+    fn looping_guard_judges_answer_not_reasoning() {
+        // A reasoning model re-quoting the same line while ruminating is a
+        // GOOD response — the guard must not rotate away from it.
+        let ruminating = format!(
+            "<think>{}</think>{{\"test_code\": \"ok\"}}",
+            "maybe: import {{ createGameState }} from './helpers';\n".repeat(12)
+        );
+        assert!(!is_looping_output(&ruminating));
+        // But a loop in the ANSWER (after the think block) still trips it.
+        let bad = format!("<think>brief</think>{}", "// the 'fed' case again\n".repeat(30));
+        assert!(is_looping_output(&bad));
+        // Loop inside an UNCLOSED think block: strips to nothing → not flagged
+        // as looping; the empty answer fails the JSON parse path instead.
+        let truncated = format!("<think>{}", "I'll use the 'fed' case.\n".repeat(30));
+        assert!(!is_looping_output(&truncated));
+        assert_eq!(extract_json(&truncated), "");
     }
 
     #[test]
