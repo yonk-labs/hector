@@ -30,6 +30,12 @@ pub enum Command {
         /// Reference path Bob may read. Repeat for multiple paths.
         #[arg(long = "reference-path")]
         reference_paths: Vec<String>,
+        /// Scope the slice from the code-symbol graph: `maple bundle` derives
+        /// editable/reference paths for this symbol and enforces the context
+        /// budget before dispatch. Repeat for multiple symbols. Explicit
+        /// --editable-path/--reference-path flags win over derived ones.
+        #[arg(long = "symbol")]
+        symbols: Vec<String>,
         /// Max changed files cap.
         #[arg(long)]
         max_changed_files: Option<u64>,

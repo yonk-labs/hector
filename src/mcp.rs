@@ -32,6 +32,11 @@ pub struct PlanCampaignParams {
     /// Files Bob may read but not edit.
     #[serde(default)]
     pub reference_paths: Option<Vec<String>>,
+    /// Symbols to scope from the code-symbol graph: `maple bundle` derives
+    /// editable/reference paths and enforces the context budget before
+    /// dispatch. Explicit path params win over derived ones.
+    #[serde(default)]
+    pub symbols: Option<Vec<String>>,
     /// Max changed files cap.
     #[serde(default)]
     pub max_changed_files: Option<u64>,
@@ -108,13 +113,36 @@ impl HectorServer {
 }
 
 fn plan_campaign(p: PlanCampaignParams) -> anyhow::Result<String> {
+    let defaults = crate::config::load_plan_defaults()?;
+
+    // Same maple scoping the CLI's --symbol flag does: derived paths fill
+    // whatever the caller didn't provide explicitly.
+    let mut editable_paths = p.editable_paths.unwrap_or_default();
+    let mut reference_paths = p.reference_paths.unwrap_or_default();
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(symbols) = p.symbols.filter(|s| !s.is_empty()) {
+        let repo = std::env::current_dir()?;
+        match crate::maple::scope_from_symbols(&repo, &symbols, defaults.maple_budget)? {
+            Some(scope) => {
+                if editable_paths.is_empty() {
+                    editable_paths = scope.editable_paths;
+                }
+                if reference_paths.is_empty() {
+                    reference_paths = scope.reference_paths;
+                }
+            }
+            // maple missing is a degradation the caller must see, not an error.
+            None => warnings.push(crate::maple::FALLBACK_WARNING.to_string()),
+        }
+    }
+
     let planned = planner::plan(planner::PlanOptions {
         task: p.task,
         name: p.name,
         spec: p.spec,
         verify_cmds: p.verify_cmds.unwrap_or_default(),
-        editable_paths: p.editable_paths.unwrap_or_default(),
-        reference_paths: p.reference_paths.unwrap_or_default(),
+        editable_paths,
+        reference_paths,
         max_changed_files: p.max_changed_files.unwrap_or(2),
         max_changed_lines: p.max_changed_lines.unwrap_or(160),
         max_iters: p.max_iters.unwrap_or(4),
@@ -124,9 +152,7 @@ fn plan_campaign(p: PlanCampaignParams) -> anyhow::Result<String> {
         auto_commit: p.auto_commit.unwrap_or(true),
         // Same standing invariants the CLI path injects — MCP-planned
         // campaigns must not silently skip the house rules.
-        invariants: crate::config::load_plan_defaults()
-            .map(|d| d.invariants)
-            .unwrap_or_default(),
+        invariants: defaults.invariants,
     })?;
 
     if planned.trim_start().starts_with('{') {
@@ -136,7 +162,7 @@ fn plan_campaign(p: PlanCampaignParams) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(&PlannedOutput {
         status: "planned",
         campaign_yaml: planned,
-        warnings: Vec::new(),
+        warnings,
     })?)
 }
 
@@ -200,6 +226,7 @@ mod tests {
             verify_cmds: Some(vec!["cargo test focused_behavior".into()]),
             editable_paths: Some(vec!["src/lib.rs".into()]),
             reference_paths: Some(vec!["tests/focused_behavior.rs".into()]),
+            symbols: None,
             max_changed_files: Some(1),
             max_changed_lines: Some(80),
             max_iters: Some(4),

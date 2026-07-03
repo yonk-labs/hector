@@ -516,3 +516,42 @@ fn plan_reports_bad_hector_yaml() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("hector.yaml"));
 }
+
+#[test]
+fn plan_with_symbol_degrades_gracefully_when_maple_missing() {
+    let dir = tmp_dir("hector-no-maple");
+    // Empty PATH → `maple` cannot be found. Explicit paths still work, and the
+    // degradation is announced on stderr instead of failing the plan.
+    let out = Command::new(env!("CARGO_BIN_EXE_hector"))
+        .current_dir(&dir)
+        .env("PATH", "")
+        .args([
+            "plan",
+            "--task",
+            "Add a focused behavior.",
+            "--verify",
+            "true",
+            "--editable-path",
+            "src/lib.rs",
+            "--symbol",
+            "whatever",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("maple not found"), "warns about fallback: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("editable_paths"), "campaign still emitted: {stdout}");
+
+    // Without explicit paths either, the planner's normal needs_input flow
+    // answers instead of a hard error.
+    let out = Command::new(env!("CARGO_BIN_EXE_hector"))
+        .current_dir(&dir)
+        .env("PATH", "")
+        .args(["plan", "--task", "Add a thing.", "--verify", "true", "--symbol", "whatever"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("needs_input"));
+}

@@ -3,6 +3,7 @@ mod config;
 mod conventions;
 mod dispatch;
 mod guidance;
+mod maple;
 mod mcp;
 mod model;
 mod planner;
@@ -22,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
             verify_cmds,
             editable_paths,
             reference_paths,
+            symbols,
             max_changed_files,
             max_changed_lines,
             max_iters,
@@ -34,6 +36,33 @@ async fn main() -> anyhow::Result<()> {
                 None => None,
             };
             let defaults = config::load_plan_defaults()?;
+
+            // --symbol: derive scope from the code-symbol graph. Explicit path
+            // flags win; maple fills only what the caller didn't provide.
+            let (editable_paths, reference_paths) = if symbols.is_empty() {
+                (editable_paths, reference_paths)
+            } else {
+                let repo = std::env::current_dir()?;
+                match maple::scope_from_symbols(&repo, &symbols, defaults.maple_budget)? {
+                    Some(scope) => {
+                        eprintln!(
+                            "hector: maple scoped {} symbol(s) → {} editable, {} reference path(s), ~{} tokens",
+                            symbols.len(),
+                            scope.editable_paths.len(),
+                            scope.reference_paths.len(),
+                            scope.total_tokens
+                        );
+                        (
+                            if editable_paths.is_empty() { scope.editable_paths } else { editable_paths },
+                            if reference_paths.is_empty() { scope.reference_paths } else { reference_paths },
+                        )
+                    }
+                    None => {
+                        eprintln!("hector: warning — {}", maple::FALLBACK_WARNING);
+                        (editable_paths, reference_paths)
+                    }
+                }
+            };
 
 // LLM path: if no verify command provided AND model config exists,
 // hector's model writes a focused test against the provided --spec.

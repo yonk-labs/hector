@@ -24,6 +24,8 @@ bob:
 #   - { name: gemma,   model: \"cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit\", base_url: \"http://192.168.1.133:8000/v1\" }
 #   - { name: minimax, model: \"MiniMax-M3\", base_url: \"https://api.minimax.io/v1\", api_key_env: MINIMAX_API_KEY }
 # default_model: qwen
+# maple:
+#   budget: 12000   # max approx context tokens when scoping via --symbol
 ";
 
 #[derive(Debug)]
@@ -35,6 +37,8 @@ pub struct PlanDefaults {
     /// Standing constraints ("never weaken an assertion", "no new deps")
     /// appended to every generated slice spec.
     pub invariants: Vec<String>,
+    /// Context-token budget for maple-derived scope (`hector plan --symbol`).
+    pub maple_budget: u64,
 }
 
 impl PlanDefaults {
@@ -51,6 +55,7 @@ impl PlanDefaults {
             judge_policy: cfg.judge.default_policy.unwrap_or(self.judge_policy),
             auto_commit: cfg.bob.campaign_auto_commit.unwrap_or(self.auto_commit),
             invariants: cfg.invariants,
+            maple_budget: cfg.maple.budget.unwrap_or(self.maple_budget),
         }
     }
 }
@@ -63,6 +68,7 @@ impl Default for PlanDefaults {
             judge_policy: "retry_on_fail".to_string(),
             auto_commit: true,
             invariants: Vec::new(),
+            maple_budget: 12_000,
         }
     }
 }
@@ -83,6 +89,13 @@ struct HectorConfig {
     review: ReviewConfig,
     #[serde(default)]
     invariants: Vec<String>,
+    #[serde(default)]
+    maple: MapleConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MapleConfig {
+    budget: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
