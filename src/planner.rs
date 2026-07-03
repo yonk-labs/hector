@@ -258,10 +258,60 @@ fn tail_str(s: &str, max: usize) -> String {
     chars.into_iter().collect()
 }
 
+/// Pull the identifier a "missing symbol" error names, e.g. "warWearinessPenalty"
+/// out of `TypeError: warWearinessPenalty is not a function` or the Babel/CJS
+/// interop form `(0 , _core_moraleUtils.warWearinessPenalty) is not a function`.
+/// Returns None when the text before the marker isn't a plain identifier (e.g.
+/// `Class extends value #<Object> is not a constructor` — nothing nameable there).
+fn extract_missing_symbol(output: &str) -> Option<String> {
+    const SUFFIX_MARKERS: &[&str] = &[" is not a function", " is not a constructor", " is not defined"];
+    for marker in SUFFIX_MARKERS {
+        if let Some(idx) = output.find(marker) {
+            // CJS interop wraps the reference in a trailing paren, e.g.
+            // "(0 , _mod.fn) is not a function" — peel it before scanning back.
+            let before = output[..idx].trim_end_matches(')');
+            let token: String = before
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$' || *c == '.')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            // Dotted access (module.symbol) — the symbol under test is the
+            // last segment, not the module namespace it hangs off of.
+            if let Some(ident) = token.rsplit('.').next().filter(|s| !s.is_empty()) {
+                return Some(ident.to_string());
+            }
+        }
+    }
+    const PREFIX_MARKER: &str = "has no exported member";
+    if let Some(idx) = output.find(PREFIX_MARKER) {
+        let after = output[idx + PREFIX_MARKER.len()..]
+            .trim_start()
+            .trim_start_matches(['\'', '"']);
+        let ident: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+            .collect();
+        if !ident.is_empty() {
+            return Some(ident);
+        }
+    }
+    None
+}
+
 /// Distinguish "test file itself is broken" (import/syntax/module errors) from
 /// "feature isn't implemented yet" (assertion failures). Hector retries on
 /// infrastructure errors but accepts assertion failures as the correct RED state.
-fn is_infrastructure_error(output: &str) -> bool {
+///
+/// `base_prompt` is the TASK+SPEC text the test-writer was given. A "missing
+/// symbol" error (is not a function / is not defined / has no exported member)
+/// that names the symbol under test is TDD working as designed — the function
+/// doesn't exist yet, that's the correct red state, not a broken test. The same
+/// error naming some OTHER symbol (a broken import, a typo'd helper) is still
+/// infrastructure: the test itself can't load.
+fn is_infrastructure_error(output: &str, base_prompt: &str) -> bool {
     let lower = output.to_lowercase();
     const PATTERNS: &[&str] = &[
         "cannot find module",
@@ -277,12 +327,21 @@ fn is_infrastructure_error(output: &str) -> bool {
         "module not found",
         "no such file or directory",
         "class extends value",
+        "has no exported member",
     ];
     // But NOT when it's clearly an assertion failure that happens to contain a keyword
     if lower.contains("expect(received)") || lower.contains("assertion") {
         return false;
     }
-    PATTERNS.iter().any(|p| lower.contains(p))
+    if !PATTERNS.iter().any(|p| lower.contains(p)) {
+        return false;
+    }
+    if let Some(symbol) = extract_missing_symbol(output) {
+        if base_prompt.contains(&symbol) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -293,31 +352,96 @@ mod infra_tests {
     fn detects_import_error() {
         let out = "TypeError: Class extends value #<Object> is not a constructor or null\n\
                    at Object.<anonymous> (tests/player.test.js:1:18)";
-        assert!(is_infrastructure_error(out));
+        assert!(is_infrastructure_error(out, ""));
     }
 
     #[test]
     fn detects_module_not_found() {
         let out = "Error: Cannot find module '../src/body'\nRequire stack:";
-        assert!(is_infrastructure_error(out));
+        assert!(is_infrastructure_error(out, ""));
     }
 
     #[test]
     fn detects_syntax_error() {
         let out = "SyntaxError: Unexpected token }";
-        assert!(is_infrastructure_error(out));
+        assert!(is_infrastructure_error(out, ""));
     }
 
     #[test]
     fn does_not_flag_assertion_failure() {
         let out = "expect(received).toBe(expected)\nExpected: 28\nReceived: 27";
-        assert!(!is_infrastructure_error(out));
+        assert!(!is_infrastructure_error(out, ""));
     }
 
     #[test]
     fn does_not_flag_test_failure_summary() {
         let out = "FAIL tests/body.test.js\nTests: 1 failed, 7 passed";
-        assert!(!is_infrastructure_error(out));
+        assert!(!is_infrastructure_error(out, ""));
+    }
+
+    // --- new-symbol-under-test vs. broken-import disambiguation ---
+
+    #[test]
+    fn new_function_under_test_is_legitimate_red_not_infra() {
+        // TDD red state: warWearinessPenalty is the function the spec asked
+        // for and doesn't exist yet — the frozen test is correct, not broken.
+        let base_prompt = "## TASK\nAdd a pure function warWearinessPenalty(turns) \
+                            to core/moraleUtils.ts.\n\n\
+                            ## SPEC\nwarWearinessPenalty(0) must return 0.";
+        let out = "TypeError: warWearinessPenalty is not a function\n\
+                   at Object.<anonymous> (core/moraleUtils.test.ts:5:18)";
+        assert!(!is_infrastructure_error(out, base_prompt));
+    }
+
+    #[test]
+    fn new_function_under_test_babel_cjs_interop_form_is_not_infra() {
+        // Jest's CJS interop wraps the reference: "(0 , _mod.fn) is not a function".
+        let base_prompt = "## TASK\nAdd warWearinessPenalty to core/moraleUtils.\n\n\
+                            ## SPEC\nwarWearinessPenalty(3) must return 6.";
+        let out = "TypeError: (0 , _core_moraleUtils.warWearinessPenalty) is not a function";
+        assert!(!is_infrastructure_error(out, base_prompt));
+    }
+
+    #[test]
+    fn unrelated_broken_import_is_not_a_function_is_still_infra() {
+        // The spec is about warWearinessPenalty; someOtherHelper never appears
+        // in it — this is a broken/typo'd import in the test file, not TDD red.
+        let base_prompt = "## TASK\nAdd a pure function warWearinessPenalty(turns).\n\n\
+                            ## SPEC\nwarWearinessPenalty(0) must return 0.";
+        let out = "TypeError: someOtherHelper is not a function\n\
+                   at Object.<anonymous> (core/moraleUtils.test.ts:5:18)";
+        assert!(is_infrastructure_error(out, base_prompt));
+    }
+
+    #[test]
+    fn broken_import_still_infra_even_when_prompt_mentions_the_module() {
+        // "Cannot find module" isn't a missing-symbol pattern — the exemption
+        // never applies, even if the module name happens to appear in the
+        // prompt (e.g. it's a legitimate reference path the test typo'd).
+        let base_prompt = "## REFERENCE FILES\ncore/body.ts";
+        let out = "Error: Cannot find module '../core/body'\nRequire stack:";
+        assert!(is_infrastructure_error(out, base_prompt));
+    }
+
+    #[test]
+    fn new_symbol_is_not_defined_is_not_infra() {
+        let base_prompt = "## SPEC\nCall warWearinessPenalty(turns) directly (no import).";
+        let out = "ReferenceError: warWearinessPenalty is not defined";
+        assert!(!is_infrastructure_error(out, base_prompt));
+    }
+
+    #[test]
+    fn new_symbol_has_no_exported_member_is_not_infra() {
+        let base_prompt = "## SPEC\nExport warWearinessPenalty from core/moraleUtils.";
+        let out = "TS2305: Module '\"../core/moraleUtils\"' has no exported member 'warWearinessPenalty'.";
+        assert!(!is_infrastructure_error(out, base_prompt));
+    }
+
+    #[test]
+    fn unrelated_has_no_exported_member_is_still_infra() {
+        let base_prompt = "## SPEC\nwarWearinessPenalty(0) must return 0.";
+        let out = "TS2305: Module '\"../core/moraleUtils\"' has no exported member 'someOtherHelper'.";
+        assert!(is_infrastructure_error(out, base_prompt));
     }
 
     #[test]
@@ -462,7 +586,7 @@ async fn write_test_attempts(
         }
 
         // Test failed (red). But WHY? Infrastructure error vs assertion failure.
-        if is_infrastructure_error(&output_text) {
+        if is_infrastructure_error(&output_text, base_prompt) {
             if infra_attempt < max_retries {
                 infra_attempt += 1;
                 eprintln!(
