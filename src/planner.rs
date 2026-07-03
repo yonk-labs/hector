@@ -95,6 +95,82 @@ pub fn plan(opts: PlanOptions) -> anyhow::Result<String> {
     Ok(yaml)
 }
 
+/// Cap on carried-forward lessons text per file (chars). Lessons files append
+/// over time, so the TAIL (newest entries) is what survives the cap.
+const LESSONS_CAP: usize = 4_000;
+
+/// HECTOR_SPEC's "carry forward project lessons": append `.hector/lessons.md`
+/// and `.bob/lessons.md` (when present under `root`) to the spec so hard-won
+/// project knowledge reaches every builder. Missing/empty files are skipped;
+/// no lessons → spec unchanged.
+pub fn apply_lessons(spec: Option<String>, root: &Path) -> Option<String> {
+    let mut lessons = String::new();
+    for rel in [".hector/lessons.md", ".bob/lessons.md"] {
+        let Ok(text) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let truncated = text.chars().count() > LESSONS_CAP;
+        let tail = tail_str(text, LESSONS_CAP);
+        let marker = if truncated { " (most recent tail)" } else { "" };
+        lessons.push_str(&format!("### From {rel}{marker}\n{tail}\n\n"));
+    }
+    if lessons.is_empty() {
+        return spec;
+    }
+    let block = format!(
+        "## Project lessons (carried forward)\n\n{}",
+        lessons.trim_end()
+    );
+    Some(match spec {
+        Some(s) => format!("{}\n\n{}", s.trim_end(), block),
+        None => block,
+    })
+}
+
+#[cfg(test)]
+mod lessons_tests {
+    use super::apply_lessons;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hector-lessons-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".hector")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn appends_lessons_and_keeps_tail_when_capped() {
+        let dir = tmp("basic");
+        std::fs::write(dir.join(".hector/lessons.md"), "always run tests --runInBand").unwrap();
+        let out = apply_lessons(Some("spec".into()), &dir).unwrap();
+        assert!(out.starts_with("spec"));
+        assert!(out.contains("## Project lessons"));
+        assert!(out.contains("--runInBand"));
+
+        // Oversized file: only the newest tail survives, flagged as such.
+        let big = format!("{}NEWEST", "x".repeat(10_000));
+        std::fs::write(dir.join(".hector/lessons.md"), big).unwrap();
+        let out = apply_lessons(None, &dir).unwrap();
+        assert!(out.contains("NEWEST"));
+        assert!(out.contains("most recent tail"));
+        assert!(out.chars().count() < 5_000);
+    }
+
+    #[test]
+    fn no_lessons_files_leaves_spec_untouched() {
+        let dir = tmp("none");
+        assert_eq!(apply_lessons(Some("spec".into()), &dir).as_deref(), Some("spec"));
+        assert_eq!(apply_lessons(None, &dir), None);
+        // Empty file also skipped.
+        std::fs::write(dir.join(".hector/lessons.md"), "  \n").unwrap();
+        assert_eq!(apply_lessons(None, &dir), None);
+    }
+}
+
 #[cfg(test)]
 mod invariant_tests {
     use super::apply_invariants;

@@ -139,17 +139,18 @@ fn plan_campaign(p: PlanCampaignParams) -> anyhow::Result<String> {
     let planned = planner::plan(planner::PlanOptions {
         task: p.task,
         name: p.name,
-        spec: p.spec,
+        // Same lessons carry-forward the CLI applies (HECTOR_SPEC "project lessons").
+        spec: planner::apply_lessons(p.spec, &std::env::current_dir()?),
         verify_cmds: p.verify_cmds.unwrap_or_default(),
         editable_paths,
         reference_paths,
-        max_changed_files: p.max_changed_files.unwrap_or(2),
-        max_changed_lines: p.max_changed_lines.unwrap_or(160),
+        // hector.yaml defaults, same as the CLI path — previously hardcoded
+        // here, so MCP-planned campaigns ignored the project's config.
+        max_changed_files: p.max_changed_files.unwrap_or(defaults.max_changed_files),
+        max_changed_lines: p.max_changed_lines.unwrap_or(defaults.max_changed_lines),
         max_iters: p.max_iters.unwrap_or(4),
-        judge_policy: p
-            .judge_policy
-            .unwrap_or_else(|| "retry_on_fail".to_string()),
-        auto_commit: p.auto_commit.unwrap_or(true),
+        judge_policy: p.judge_policy.unwrap_or(defaults.judge_policy),
+        auto_commit: p.auto_commit.unwrap_or(defaults.auto_commit),
         // Same standing invariants the CLI path injects — MCP-planned
         // campaigns must not silently skip the house rules.
         invariants: defaults.invariants,

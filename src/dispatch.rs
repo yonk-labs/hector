@@ -32,6 +32,11 @@ pub struct DispatchReport {
     /// working tree was NOT modified). None in apply mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     proposed_diff: Option<String>,
+    /// Advisory blast radius from `maple impact`: symbols the landed diff
+    /// touched plus their callers. None when nothing landed, in --propose
+    /// mode, or when maple is unavailable — never blocks a dispatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    impact: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -256,6 +261,11 @@ pub async fn run_campaign(
             );
         }
     }
+    // Pre-dispatch HEAD: deps-mode batches commit as they land, so the final
+    // blast-radius diff is working-tree-vs-this-rev.
+    let start_rev = git(&apply_dir, &["rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .ok();
 
     let semaphore = Arc::new(Semaphore::new(max_jobs));
     let start = Instant::now();
@@ -368,6 +378,27 @@ pub async fn run_campaign(
         (run_combined_verify(&apply_dir, merged, &combined_verify), None)
     };
 
+    // Advisory blast radius of what actually landed. Skipped in --propose
+    // (working tree untouched) and when nothing applied.
+    let landed_any = slices.iter().any(|s| s.applied);
+    let impact = if landed_any && !propose {
+        let base = if deps_mode { start_rev.as_deref() } else { None };
+        let summary = crate::maple::impact_summary(&apply_dir, base);
+        if let Some(v) = &summary {
+            let touched = v
+                .get("changed_symbols")
+                .and_then(|a| a.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            eprintln!(
+                "hector dispatch: impact — {touched} symbol(s) touched (advisory, see report.impact)"
+            );
+        }
+        summary
+    } else {
+        None
+    };
+
     let wall = start.elapsed().as_secs();
     let converged = slices.iter().filter(|s| s.status == "converged").count();
     let failed = slices.len() - converged;
@@ -382,6 +413,7 @@ pub async fn run_campaign(
         slices,
         integration,
         proposed_diff,
+        impact,
     })
 }
 

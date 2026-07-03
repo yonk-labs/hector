@@ -104,6 +104,47 @@ pub fn scope_from_symbols(
 pub const FALLBACK_WARNING: &str = "maple not found on PATH — symbol scoping and context-budget \
      check skipped; falling back to explicitly provided paths";
 
+/// Post-merge blast radius via `maple impact`: symbols the landed diff touched
+/// plus their callers. `base_rev: Some(rev)` diffs the working tree against
+/// that rev (deps-mode dispatch, batches already committed); `None` reads the
+/// staged diff (flat apply mode, `git apply --index` staged everything).
+/// Purely advisory — returns None (with a stderr note) on any failure, and
+/// silently when maple isn't installed.
+pub fn impact_summary(repo: &Path, base_rev: Option<&str>) -> Option<serde_json::Value> {
+    let mut cmd = std::process::Command::new("maple");
+    cmd.arg("impact").arg(repo);
+    match base_rev {
+        Some(rev) => {
+            cmd.arg("--diff").arg(rev);
+        }
+        None => {
+            cmd.arg("--staged");
+        }
+    }
+    let out = match cmd.output() {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!("hector dispatch: maple impact could not run: {e}");
+            return None;
+        }
+    };
+    if !out.status.success() {
+        eprintln!(
+            "hector dispatch: maple impact failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return None;
+    }
+    match serde_json::from_slice(&out.stdout) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("hector dispatch: maple impact returned unparseable JSON: {e}");
+            None
+        }
+    }
+}
+
 /// Pure half of scope derivation: merge per-symbol bundles into one scope and
 /// enforce the combined budget. Separated from the shell-out for testing.
 fn build_scope(bundles: Vec<(String, Bundle)>, budget: u64) -> anyhow::Result<MapleScope> {

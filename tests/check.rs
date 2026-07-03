@@ -748,3 +748,30 @@ slices:
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("clean tree"));
 }
+
+#[test]
+fn plan_carries_forward_project_lessons() {
+    let dir = tmp_dir("hector-lessons");
+    fs::create_dir_all(dir.join(".hector")).unwrap();
+    fs::write(
+        dir.join(".hector/lessons.md"),
+        "vitest here needs --runInBand or the AI gates flake",
+    )
+    .unwrap();
+    let out = hector_in(
+        &dir,
+        &[
+            "plan",
+            "--task",
+            "Add a focused behavior.",
+            "--verify",
+            "true",
+            "--editable-path",
+            "src/lib.rs",
+        ],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Project lessons"), "{stdout}");
+    assert!(stdout.contains("--runInBand"), "{stdout}");
+}

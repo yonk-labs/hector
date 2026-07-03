@@ -35,6 +35,10 @@ async fn main() -> anyhow::Result<()> {
                 Some(path) => Some(std::fs::read_to_string(path)?),
                 None => None,
             };
+            // Path selection below keys off whether the USER supplied a spec;
+            // lessons augmentation must not flip a no-spec plan into the LLM path.
+            let user_provided_spec = spec_text.is_some();
+            let spec_text = planner::apply_lessons(spec_text, &std::env::current_dir()?);
             let defaults = config::load_plan_defaults()?;
 
             // --symbol: derive scope from the code-symbol graph. Explicit path
@@ -72,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
 // focused test against the spec. Without a spec we fall through to the
 // deterministic planner, which returns friendly needs_input guidance rather than
 // hard-erroring — `hector plan --task X` should tell the user what's missing.
-if verify_cmds.iter().all(|c| c.trim().is_empty()) && spec_text.is_some() {
+if verify_cmds.iter().all(|c| c.trim().is_empty()) && user_provided_spec {
     let model_cfg = config::load_default_model()?;
     if let Some(cfg) = model_cfg {
         let repo_root = std::env::current_dir()?;
