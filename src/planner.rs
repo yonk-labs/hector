@@ -402,6 +402,26 @@ mod infra_tests {
         assert!(!is_infrastructure_error(out, base_prompt));
     }
 
+    // #19: a truncated / reasoning-only model response must classify as EOF so
+    // the plan loop rotates models instead of wasting a re-ask. A complete but
+    // malformed object stays non-EOF and keeps the one re-ask.
+    #[test]
+    fn truncated_or_reasoning_only_response_is_eof_class() {
+        use serde_json::error::Category;
+        let parse = |s: &str| {
+            serde_json::from_str::<super::ModelPlanResponse>(s)
+                .unwrap_err()
+                .classify()
+        };
+        // Unclosed <think>: nothing survives stripping → empty → EOF.
+        let raw = "<think>Let me plan. The path from core/incorporation";
+        assert_eq!(parse(&crate::model::extract_json(raw)), Category::Eof);
+        // Truncated mid-object (token ceiling) → unterminated → EOF.
+        assert_eq!(parse(r#"{"test_code": "half a fi"#), Category::Eof);
+        // Complete object, wrong shape → Data, NOT EOF → re-ask path survives.
+        assert_ne!(parse(r#"{"unexpected": true}"#), Category::Eof);
+    }
+
     #[test]
     fn unrelated_broken_import_is_not_a_function_is_still_infra() {
         // The spec is about warWearinessPenalty; someOtherHelper never appears
@@ -523,6 +543,21 @@ async fn write_test_attempts(
         let json_str = model::extract_json(&raw);
         let resp: ModelPlanResponse = match serde_json::from_str(&json_str) {
             Ok(r) => r,
+            // EOF-class = the JSON ended before it finished: either nothing
+            // survived <think> stripping (reasoning-only answer) or the model
+            // truncated mid-object at the token ceiling. Re-asking a model that
+            // does this just burns another call on the same failure, so bail and
+            // let the infra-retry loop rotate models — same stance as the
+            // looping-output guard above. (#19: this used to masquerade as a
+            // generic "not valid JSON, EOF" and waste the one re-ask.)
+            Err(e) if e.classify() == serde_json::error::Category::Eof => {
+                anyhow::bail!(
+                    "model returned no complete JSON object — only reasoning/prose, \
+                     or a response truncated at the token ceiling before the answer. \
+                     raw tail: {}",
+                    tail_str(&raw, 400)
+                );
+            }
             Err(e) => {
                 if !parse_retried {
                     parse_retried = true;
