@@ -172,6 +172,35 @@ mod lessons_tests {
 }
 
 #[cfg(test)]
+mod reference_block_tests {
+    use super::reference_files_block;
+
+    #[test]
+    fn includes_bodies_skips_missing_and_caps() {
+        let dir = std::env::temp_dir().join(format!("hector-refs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("small.ts"), "export const FIXTURE = 1;").unwrap();
+        std::fs::write(dir.join("big.ts"), "x".repeat(10_000)).unwrap();
+
+        let block = reference_files_block(
+            &["small.ts".into(), "missing.ts".into(), "big.ts".into()],
+            &dir,
+        );
+        assert!(block.contains("### small.ts"));
+        assert!(block.contains("export const FIXTURE = 1;"));
+        assert!(!block.contains("missing.ts"), "unreadable paths are skipped");
+        assert!(block.contains("(truncated)"), "oversized file is truncated");
+        assert!(block.chars().count() < 20_000);
+    }
+
+    #[test]
+    fn empty_paths_yield_empty_block() {
+        assert_eq!(reference_files_block(&[], &std::env::temp_dir()), "");
+    }
+}
+
+#[cfg(test)]
 mod invariant_tests {
     use super::apply_invariants;
 
@@ -317,62 +346,75 @@ Rules:\n\
 Output schema:\n\
 {\"test_code\": \"full file contents\", \"test_path\": \"relative/path\", \"verify_cmd\": \"command\", \"editable_paths\": [\"paths\"], \"reasoning\": \"one sentence\"}";
 
-/// LLM-backed planning: the frontier model (or human) writes the spec, hector's
-/// smaller model writes a focused test against that spec. The spec is the
-/// contract; the test is the proof. Hector runs the red probe, freezes both
-/// into a campaign for bob to implement.
-pub async fn plan_with_model(
-    opts: PlanOptions,
+/// One model's attempt(s) at writing the focused test, red probe included.
+/// On failure, every test file this model wrote is removed — a leftover
+/// broken test from a failed planner run would poison the repo's suite.
+async fn write_test_with(
     cfg: &ModelCfg,
-    conventions: &Conventions,
+    base_prompt: &str,
     repo_root: &Path,
-) -> anyhow::Result<String> {
-    if opts.task.trim().is_empty() {
-        anyhow::bail!("task is required for model-backed planning");
+) -> anyhow::Result<ModelPlanResponse> {
+    let mut written: Vec<std::path::PathBuf> = Vec::new();
+    let result = write_test_attempts(cfg, base_prompt, repo_root, &mut written).await;
+    if result.is_err() {
+        for p in &written {
+            let _ = std::fs::remove_file(p);
+        }
     }
-    // Spec is REQUIRED in the LLM path. The frontier model is the spec author;
-    // hector only writes tests. Without a spec, we can't generate a meaningful
-    // test — refuse and ask for one rather than inventing both.
-    let spec = match opts.spec.as_deref() {
-        Some(s) if !s.trim().is_empty() => s.to_string(),
-        _ => anyhow::bail!(
-            "--spec is required when using the LLM planning path. \
-             The frontier model (or human) writes the behavior contract; \
-             hector only writes the focused test against that contract. \
-             Provide a detailed spec file with API signatures, expected behavior, \
-             edge cases, and acceptance criteria."
-        ),
-    };
+    result
+}
 
-    let user_prompt = format!(
-        "## TASK\n{task}\n\n\
-         ## SPEC (authoritative — write a test that exercises this exact behavior)\n{spec}\n\n\
-         ## REPO CONVENTIONS\n{conv}\n\n\
-         Write ONE focused test that proves the spec. Output JSON only.",
-        task = opts.task,
-        spec = spec,
-        conv = conventions.prompt_block(),
-    );
-
-    eprintln!("hector: asking model '{}' to write a focused test against the spec...", cfg.name);
-
-    // Retry loop: if the test has an infrastructure error (import/syntax/module),
-    // re-ask the model with the error. Distinguish from assertion failures (correct red).
+async fn write_test_attempts(
+    cfg: &ModelCfg,
+    base_prompt: &str,
+    repo_root: &Path,
+    written: &mut Vec<std::path::PathBuf>,
+) -> anyhow::Result<ModelPlanResponse> {
     // Hard caps to prevent infinite loop of doom:
-    //   max_retries = infra-error retries (model wrote a broken test)
-    //   loop_budget = absolute ceiling on total attempts (any failure type)
+    //   max_retries  = infra-error retries (model wrote a test that can't load)
+    //   parse retry  = ONE re-ask on invalid JSON (with the parse error shown)
+    //   loop_budget  = absolute ceiling on total model calls
     let max_retries = 2;
-    let loop_budget = 4; // hard ceiling: 1 initial + 2 infra retries + 1 spare
-    let mut attempt = 0;
-    let mut total_attempts = 0;
-    let mut current_prompt = user_prompt.clone();
-    let mut resp: ModelPlanResponse;
+    let loop_budget = 4;
+    let mut infra_attempt = 0;
+    let mut parse_retried = false;
+    let mut total_calls = 0;
+    let mut current_prompt = base_prompt.to_string();
 
     loop {
+        total_calls += 1;
+        if total_calls > loop_budget {
+            anyhow::bail!("attempt budget exhausted ({loop_budget} model calls)");
+        }
         let raw = model::complete(cfg, PLANNING_SYSTEM, &current_prompt).await?;
+
+        // Degenerate output (repetition death spiral) is a model failure, not
+        // something a re-ask fixes — rotate immediately.
+        if model::is_looping_output(&raw) {
+            anyhow::bail!("output is looping (same segment repeated) — likely truncated at the token ceiling");
+        }
+
         let json_str = model::extract_json(&raw);
-        resp = serde_json::from_str(json_str)
-            .map_err(|e| anyhow::anyhow!("parse model plan response: {e}\nraw: {raw}"))?;
+        let resp: ModelPlanResponse = match serde_json::from_str(&json_str) {
+            Ok(r) => r,
+            Err(e) => {
+                if !parse_retried {
+                    parse_retried = true;
+                    eprintln!("hector: response was not valid JSON ({e}), re-asking once...");
+                    current_prompt = format!(
+                        "{base_prompt}\n\n\
+                         ## YOUR PREVIOUS RESPONSE WAS NOT VALID JSON\n\
+                         Parse error: {e}\n\
+                         Output ONLY the JSON object — no prose, no fences, no reasoning."
+                    );
+                    continue;
+                }
+                anyhow::bail!(
+                    "response is not valid JSON after a retry: {e}\nraw tail: {}",
+                    tail_str(&raw, 400)
+                );
+            }
+        };
 
         eprintln!("hector: model wrote test → {}", resp.test_path);
 
@@ -382,6 +424,9 @@ pub async fn plan_with_model(
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&test_path_full, &resp.test_code)?;
+        if !written.contains(&test_path_full) {
+            written.push(test_path_full.clone());
+        }
 
         // Red probe — run the verify command, confirm the test FAILS
         eprintln!("hector: red probe — running '{}'", resp.verify_cmd);
@@ -411,16 +456,15 @@ pub async fn plan_with_model(
             eprintln!(
                 "hector: warning — test passed immediately (green). Either the feature exists or the test is wrong."
             );
-            break;
+            return Ok(resp);
         }
 
         // Test failed (red). But WHY? Infrastructure error vs assertion failure.
         if is_infrastructure_error(&output_text) {
-            total_attempts += 1;
-            if attempt < max_retries && total_attempts <= loop_budget {
-                attempt += 1;
+            if infra_attempt < max_retries {
+                infra_attempt += 1;
                 eprintln!(
-                    "hector: test has infrastructure error, retrying ({attempt}/{max_retries})..."
+                    "hector: test has infrastructure error, retrying ({infra_attempt}/{max_retries})..."
                 );
                 current_prompt = format!(
                     "{initial}\n\n\
@@ -430,19 +474,136 @@ pub async fn plan_with_model(
                      - Check require/import statements match module exports\n\
                      - For CommonJS: use `const {{ X }} = require(...)` not `const X = require(...)`\n\
                      - Verify file paths are correct (../src/ vs ./)\n",
-                    initial = user_prompt,
+                    initial = base_prompt,
                     err = tail_str(&output_text, 800)
                 );
                 continue;
             }
-            eprintln!(
-                "hector: warning — test has infrastructure error after {max_retries} retries, accepting anyway"
+            // Never "accept anyway": a test that can't load is a guaranteed
+            // wasted bob run — the frozen verify gate could never pass.
+            anyhow::bail!(
+                "test still has infrastructure errors after {max_retries} retries: {}",
+                tail_str(&output_text, 300)
             );
-        } else {
-            eprintln!("hector: test fails as expected (red) ✓");
         }
-        break;
+        eprintln!("hector: test fails as expected (red) ✓");
+        return Ok(resp);
     }
+}
+
+/// Per-reference-file and total caps (chars) for reference content fed to the
+/// test-writer. The LAN models degrade past ~16k input tokens; the spec +
+/// conventions already take a share of that.
+const REF_FILE_CAP: usize = 4_000;
+const REF_TOTAL_CAP: usize = 12_000;
+
+/// Read reference file bodies for the test-writer prompt. "Copy the fixture
+/// style of core/economy.test.ts" is physically impossible when the model only
+/// sees the path — that miss made qwen invent a `./testHelpers` module in the
+/// expansion-empire pilot. Unreadable paths are skipped (they may be globs or
+/// not-yet-written files); oversized content is truncated, never dropped.
+fn reference_files_block(paths: &[String], root: &Path) -> String {
+    let mut out = String::new();
+    for p in paths {
+        if out.chars().count() >= REF_TOTAL_CAP {
+            out.push_str("(further reference files omitted — context budget)\n");
+            break;
+        }
+        let Ok(text) = std::fs::read_to_string(root.join(p)) else {
+            continue;
+        };
+        let head: String = text.chars().take(REF_FILE_CAP).collect();
+        let marker = if text.chars().count() > REF_FILE_CAP {
+            "\n… (truncated)"
+        } else {
+            ""
+        };
+        out.push_str(&format!("### {p}\n```\n{head}{marker}\n```\n"));
+    }
+    out
+}
+
+/// LLM-backed planning: the frontier model (or human) writes the spec, hector's
+/// smaller model writes a focused test against that spec. The spec is the
+/// contract; the test is the proof. Hector runs the red probe, freezes both
+/// into a campaign for bob to implement.
+///
+/// `models` is the rotation order (default first): a model whose output is
+/// unusable — looping, unparseable after a retry, or a test that can't even
+/// load after infra retries — is dropped and the next one tried. Only when
+/// every configured model fails does planning fail (with a non-zero exit; a
+/// campaign that was never written must never look like success).
+pub async fn plan_with_model(
+    opts: PlanOptions,
+    models: &[ModelCfg],
+    conventions: &Conventions,
+    repo_root: &Path,
+) -> anyhow::Result<String> {
+    if opts.task.trim().is_empty() {
+        anyhow::bail!("task is required for model-backed planning");
+    }
+    if models.is_empty() {
+        anyhow::bail!("no planner models configured");
+    }
+    // Spec is REQUIRED in the LLM path. The frontier model is the spec author;
+    // hector only writes tests. Without a spec, we can't generate a meaningful
+    // test — refuse and ask for one rather than inventing both.
+    let spec = match opts.spec.as_deref() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => anyhow::bail!(
+            "--spec is required when using the LLM planning path. \
+             The frontier model (or human) writes the behavior contract; \
+             hector only writes the focused test against that contract. \
+             Provide a detailed spec file with API signatures, expected behavior, \
+             edge cases, and acceptance criteria."
+        ),
+    };
+
+    let refs = reference_files_block(&opts.reference_paths, repo_root);
+    let refs_section = if refs.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "## REFERENCE FILES (read-only — copy their style, imports, and helpers; do NOT invent modules that aren't imported here)\n{refs}\n"
+        )
+    };
+
+    let user_prompt = format!(
+        "## TASK\n{task}\n\n\
+         ## SPEC (authoritative — write a test that exercises this exact behavior)\n{spec}\n\n\
+         ## REPO CONVENTIONS\n{conv}\n\n\
+         {refs_section}\
+         Write ONE focused test that proves the spec. Output JSON only.",
+        task = opts.task,
+        spec = spec,
+        conv = conventions.prompt_block(),
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut resp: Option<ModelPlanResponse> = None;
+    for cfg in models {
+        eprintln!(
+            "hector: asking model '{}' to write a focused test against the spec...",
+            cfg.name
+        );
+        match write_test_with(cfg, &user_prompt, repo_root).await {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(e) => {
+                eprintln!("hector: model '{}' failed to produce a usable test: {e}", cfg.name);
+                failures.push(format!("{}: {e}", cfg.name));
+            }
+        }
+    }
+    let Some(resp) = resp else {
+        anyhow::bail!(
+            "all {} configured planner model(s) failed to produce a usable test:\n  {}",
+            models.len(),
+            failures.join("\n  ")
+        );
+    };
 
     // Freeze into campaign — spec from upstream is authoritative, test from hector
     let name = opts.name.unwrap_or_else(|| slug(&opts.task));

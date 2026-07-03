@@ -20,6 +20,9 @@ pub struct DispatchReport {
     jobs: usize,
     total_slices: usize,
     converged: usize,
+    /// Slices whose verify gates were already green on base — a re-dispatch
+    /// of a partially-landed campaign. Skipped (no bob run), counted as done.
+    already_landed: usize,
     failed: usize,
     wall_secs: u64,
     slices: Vec<SliceResult>,
@@ -64,6 +67,33 @@ pub struct SliceResult {
     /// all parallel builds finish. Internal — not part of the JSON report.
     #[serde(skip)]
     diff: String,
+}
+
+/// Slice outcomes that count as "done" rather than failed.
+fn is_success(status: &str) -> bool {
+    status == "converged" || status == "already_landed"
+}
+
+impl DispatchReport {
+    /// True when automation can trust this dispatch: every slice landed (or
+    /// was already landed) and the merged-tree integration gates passed.
+    pub fn succeeded(&self) -> bool {
+        self.failed == 0 && self.integration.as_ref().is_none_or(|i| i.verified)
+    }
+}
+
+/// Skip-green pre-flight: all of the slice's verify gates already pass on the
+/// current tree. Re-dispatching a partially-landed campaign used to re-run the
+/// landed slice — bob burned a full build (909s in the pilot) to produce an
+/// empty diff that read as a failure and skipped its dependents.
+fn slice_already_green(repo: &Path, slice: &Slice) -> bool {
+    let gates: Vec<&String> = slice
+        .verify_cmds
+        .iter()
+        .flatten()
+        .filter(|c| !c.trim().is_empty())
+        .collect();
+    !gates.is_empty() && gates.iter().all(|c| run_gate(repo, c).is_ok())
 }
 
 /// Uniform error/skip result constructor.
@@ -252,12 +282,15 @@ pub async fn run_campaign(
 
     let apply_dir = std::env::current_dir()?;
     if deps_mode {
-        let dirty = git(&apply_dir, &["status", "--porcelain"])
+        // Untracked files are ignored: batch commits only sweep the staged
+        // changes apply_diff creates, and real repos always carry untracked
+        // artifacts (.bob/, .maple/, node_modules) that must not block dispatch.
+        let dirty = git(&apply_dir, &["status", "--porcelain", "--untracked-files=no"])
             .map_err(|e| anyhow::anyhow!("git status failed: {e}"))?;
         if !dirty.trim().is_empty() {
             anyhow::bail!(
                 "depends_on dispatch commits between batches — start from a \
-                 clean tree (git status shows pending changes)"
+                 clean tree (git status shows pending changes to tracked files)"
             );
         }
     }
@@ -295,8 +328,18 @@ pub async fn run_campaign(
             let campaign_dir = apply_dir.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
-                eprintln!("hector dispatch: starting '{slice_name}'");
                 let slice_start = Instant::now();
+                if slice_already_green(&campaign_dir, &slice) {
+                    eprintln!(
+                        "hector dispatch: '{slice_name}' verify already green on base — already landed, skipping build"
+                    );
+                    let mut sr = error_result(&slice_name, String::new());
+                    sr.status = "already_landed".into();
+                    sr.error = None;
+                    sr.wall_secs = slice_start.elapsed().as_secs();
+                    return sr;
+                }
+                eprintln!("hector dispatch: starting '{slice_name}'");
                 let mut sr =
                     run_slice_escalating(slice, &bob, &campaign_dir, &slice_name, escalate).await;
                 sr.wall_secs = slice_start.elapsed().as_secs();
@@ -343,7 +386,7 @@ pub async fn run_campaign(
                     .map_err(|e| anyhow::anyhow!("commit of batch {} failed: {e}", batch_no + 1))?;
             }
             for sr in &batch_results {
-                if sr.status != "converged" {
+                if !is_success(&sr.status) {
                     failed_names.insert(sr.name.clone());
                 }
             }
@@ -401,13 +444,15 @@ pub async fn run_campaign(
 
     let wall = start.elapsed().as_secs();
     let converged = slices.iter().filter(|s| s.status == "converged").count();
-    let failed = slices.len() - converged;
+    let already_landed = slices.iter().filter(|s| s.status == "already_landed").count();
+    let failed = slices.len() - converged - already_landed;
 
     Ok(DispatchReport {
         campaign: campaign_name,
         jobs: max_jobs,
         total_slices: total,
         converged,
+        already_landed,
         failed,
         wall_secs: wall,
         slices,
@@ -915,5 +960,49 @@ slices:
         assert!(run_gate(&d, "true").is_ok());
         let e = run_gate(&d, "false").unwrap_err();
         assert!(e.contains("failed"), "fail message names the gate: {e}");
+    }
+
+    #[test]
+    fn skip_green_preflight_detects_landed_slice() {
+        let d = std::env::temp_dir();
+        let green = Slice {
+            verify_cmds: Some(vec!["true".into(), "true".into()]),
+            ..Default::default()
+        };
+        assert!(slice_already_green(&d, &green));
+        // One red gate → not landed, dispatch proceeds.
+        let red = Slice {
+            verify_cmds: Some(vec!["true".into(), "false".into()]),
+            ..Default::default()
+        };
+        assert!(!slice_already_green(&d, &red));
+        // No gates → never "landed" (nothing was proven).
+        assert!(!slice_already_green(&d, &Slice::default()));
+    }
+
+    fn report(failed: usize, integration: Option<IntegrationReport>) -> DispatchReport {
+        DispatchReport {
+            campaign: "c".into(),
+            jobs: 1,
+            total_slices: 1,
+            converged: 0,
+            already_landed: 0,
+            failed,
+            wall_secs: 0,
+            slices: vec![],
+            integration,
+            proposed_diff: None,
+            impact: None,
+        }
+    }
+
+    #[test]
+    fn succeeded_requires_no_failures_and_green_integration() {
+        assert!(report(0, None).succeeded());
+        assert!(!report(1, None).succeeded());
+        let green = IntegrationReport { verified: true, gates_run: 1, failures: vec![] };
+        let red = IntegrationReport { verified: false, gates_run: 1, failures: vec!["x".into()] };
+        assert!(report(0, Some(green)).succeeded());
+        assert!(!report(0, Some(red)).succeeded());
     }
 }

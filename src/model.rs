@@ -99,15 +99,62 @@ pub async fn complete(cfg: &ModelCfg, system: &str, user: &str) -> anyhow::Resul
         .ok_or_else(|| anyhow::anyhow!("no content in model response"))
 }
 
-/// Extract the outermost JSON object from text that may have markdown fences
-/// or surrounding prose. Models don't always follow "JSON only" instructions.
-pub fn extract_json(text: &str) -> &str {
-    let start = text.find('{');
-    let end = text.rfind('}');
+/// Extract the outermost JSON object from text that may have markdown fences,
+/// surrounding prose, or reasoning-model `<think>` blocks. Models don't always
+/// follow "JSON only" instructions.
+pub fn extract_json(text: &str) -> String {
+    let cleaned = strip_think_blocks(text);
+    let start = cleaned.find('{');
+    let end = cleaned.rfind('}');
     match (start, end) {
-        (Some(s), Some(e)) if s < e => &text[s..=e],
-        _ => text,
+        (Some(s), Some(e)) if s < e => cleaned[s..=e].to_string(),
+        _ => cleaned,
     }
+}
+
+/// Remove `<think>...</think>` reasoning blocks (MiniMax-M3 and friends wrap
+/// their answer in them, and the reasoning often contains `{`/`}` that fool
+/// the brace scan). An unclosed `<think>` means the answer never arrived —
+/// everything after it is reasoning, so it's dropped.
+fn strip_think_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("<think>") {
+        out.push_str(&rest[..open]);
+        match rest[open..].find("</think>") {
+            Some(close) => rest = &rest[open + close + "</think>".len()..],
+            None => {
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Degenerate-output guard: local models under context pressure loop the same
+/// phrase dozens of times ("// I'll use the 'fed' case." x33) until the token
+/// ceiling truncates the JSON mid-string. The loop usually lives INSIDE a JSON
+/// string, so the separators are escaped `\n` two-char sequences, not real
+/// newlines — split on both. Any non-trivial segment repeated ≥8 times means
+/// the response is garbage — fail fast and rotate models instead of parsing a
+/// truncated tail.
+/// ponytail: delimiter-split repeat count; add n-gram scan if models loop without separators.
+pub fn is_looping_output(text: &str) -> bool {
+    let mut counts: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    let segments = text
+        .lines()
+        .flat_map(|l| l.split("\\n"))
+        .map(str::trim)
+        .filter(|l| l.len() >= 10);
+    for seg in segments {
+        let c = counts.entry(seg).or_insert(0);
+        *c += 1;
+        if *c >= 8 {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -124,5 +171,44 @@ mod tests {
     fn extract_json_finds_object_in_prose() {
         let input = "Here is the plan:\n{\"a\": 1, \"b\": [2]}\nThat's it.";
         assert_eq!(extract_json(input), r#"{"a": 1, "b": [2]}"#);
+    }
+
+    #[test]
+    fn extract_json_strips_think_blocks() {
+        // Reasoning contains braces that would fool the outermost-brace scan.
+        let input = "<think>Let me plan {this} carefully. {\"draft\": true}</think>\n{\"a\": 1}";
+        assert_eq!(extract_json(input), r#"{"a": 1}"#);
+        // Multiple blocks.
+        let input = "<think>x</think>prefix {\"a\": 2} <think>y</think>";
+        assert_eq!(extract_json(input), r#"{"a": 2}"#);
+    }
+
+    #[test]
+    fn extract_json_drops_unclosed_think_block() {
+        // Truncated mid-reasoning: no answer exists, nothing JSON-shaped survives.
+        let input = "<think>still reasoning {\"partial\": ";
+        assert_eq!(extract_json(input), "");
+    }
+
+    #[test]
+    fn looping_output_detected() {
+        let looped = "I'll use the 'fed' case here.\n".repeat(30);
+        assert!(is_looping_output(&looped));
+        // Normal JSON responses and short repeats don't trip the guard.
+        assert!(!is_looping_output("{\"test_code\": \"ok\", \"test_path\": \"a.test.ts\"}"));
+        assert!(!is_looping_output(&"distinct line one\n".repeat(3)));
+        // Trivial short lines (blank, braces) repeat legitimately.
+        assert!(!is_looping_output(&"}\n\n{\n".repeat(40)));
+    }
+
+    #[test]
+    fn looping_inside_json_string_detected() {
+        // The gemma-26B death spiral: the repeated phrase lives INSIDE a JSON
+        // string, separated by escaped \n — the raw response is one long line.
+        let looped = format!(
+            "{{\"test_code\": \"{}",
+            "// I'll use the 'fed' case.\\n ".repeat(33)
+        );
+        assert!(is_looping_output(&looped));
     }
 }

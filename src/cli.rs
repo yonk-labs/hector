@@ -111,6 +111,13 @@ pub enum Command {
         #[arg(long)]
         escalate: bool,
     },
+    /// Show which config was loaded and the configured planner models.
+    Doctor {
+        /// Probe each model endpoint (GET /models) and mark dead entries.
+        /// Exits non-zero if any configured endpoint is dead.
+        #[arg(long)]
+        probe: bool,
+    },
     /// Run the stdio MCP server.
     Mcp,
 }

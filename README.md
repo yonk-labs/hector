@@ -53,6 +53,11 @@ bob:
 
 CLI flags override config defaults. `--no-auto-commit` always wins.
 
+Config is searched at `./hector.yaml` first, then `~/.config/hector/config.yaml`
+(same shape), so LAN model endpoints don't need copying into every repo.
+`hector doctor` shows which file is in effect; `hector doctor --probe` also
+curls each model endpoint and exits non-zero if any are dead.
+
 In a Hector context, "run it" means run `hector check` and the repo tests.
 Do not run Bob unless implementation or campaign execution is explicitly
 requested. For Bob multi-slice campaigns, `auto_commit: true` requires a clean
@@ -62,9 +67,11 @@ checkout; stop on a dirty tree or run Bob from a clean throwaway worktree.
 
 ## Commands
 
-- `hector plan` emits Bob-compatible campaign YAML, or `needs_input` JSON when required proof/scope is missing.
+- `hector plan` emits Bob-compatible campaign YAML, or `needs_input` JSON when required proof/scope is missing (exit code 2 — no campaign was written). With `--spec` and no `--verify`, a configured model writes the focused test; models are tried in rotation order and a model whose output loops, won't parse, or produces a test that can't load is dropped for the next one. Planning that produces no campaign always exits non-zero.
 - `hector check` statically rejects weak or dangerous campaigns before Bob sees them.
+- `hector dispatch` runs a campaign's slices as parallel `bob build` processes. Slices whose verify gates are already green on base are marked `already_landed` and skipped (safe re-dispatch after a partial landing). A dispatch with any failed slice or a red integration gate exits non-zero.
 - `hector review` compares Bob's result JSON against the original campaign and returns `accept`, `accept_for_human_review`, `revise_campaign`, `split_task`, or `ask_human`.
+- `hector doctor` reports the config in effect and configured models; `--probe` checks each endpoint is alive.
 - `hector frontier-brief` gives orchestrators the full handoff prompt.
 - `hector frontier-brief --compact` gives orchestrators a low-token handoff.
 - `hector init` writes a starter `hector.yaml`.

@@ -42,6 +42,9 @@ fn hector(args: &[&str]) -> std::process::Output {
 fn hector_in(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_hector"))
         .current_dir(dir)
+        // Hermetic: hector falls back to ~/.config/hector/config.yaml, which
+        // must not leak the developer's real model config into tests.
+        .env("HOME", dir)
         .args(args)
         .output()
         .unwrap()
@@ -227,11 +230,30 @@ slices:
 fn plan_needs_input_without_verify_or_editable_paths() {
     let dir = tmp_dir("plan-needs-input");
     let out = hector_in(&dir, &["plan", "--task", "Add a useful behavior"]);
-    assert!(out.status.success());
+    // needs_input is not a campaign: the questions go to stdout, but the exit
+    // code must tell automation that planning did NOT succeed.
+    assert_eq!(out.status.code(), Some(2), "needs_input exits 2");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("\"status\": \"needs_input\""));
     assert!(stdout.contains("What command proves this slice is correct?"));
     assert!(stdout.contains("Which files or directories may Bob edit?"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no campaign written"),
+        "stderr says why the exit is non-zero"
+    );
+}
+
+#[test]
+fn plan_needs_input_never_written_to_out_file() {
+    let dir = tmp_dir("plan-needs-input-out");
+    let out = hector_in(
+        &dir,
+        &["plan", "--task", "Add a useful behavior", "--out", "campaign.yaml"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    // A needs_input JSON masquerading as a campaign file would fail
+    // check/dispatch later in confusing ways — it must not be written.
+    assert!(!dir.join("campaign.yaml").exists());
 }
 
 #[test]
@@ -552,7 +574,7 @@ fn plan_with_symbol_degrades_gracefully_when_maple_missing() {
         .args(["plan", "--task", "Add a thing.", "--verify", "true", "--symbol", "whatever"])
         .output()
         .unwrap();
-    assert!(out.status.success());
+    assert_eq!(out.status.code(), Some(2), "needs_input exits 2");
     assert!(String::from_utf8_lossy(&out.stdout).contains("needs_input"));
 }
 
@@ -610,17 +632,18 @@ auto_commit: true
 slices:
   - name: a
     task: a
-    verify_cmds: ["true"]
+    verify_cmds: ["test -f a.txt"]
     editable_paths: ["a.txt"]
   - name: b
     task: b
     depends_on: [a]
-    verify_cmds: ["true"]
+    verify_cmds: ["test -f b.txt"]
     editable_paths: ["a.txt", "b.txt"]
 "#,
     );
     // Note: b's editable_paths overlap a's — legal BECAUSE they're in
-    // different batches.
+    // different batches. Gates are red on base (file missing) and green once
+    // the slice lands — the shape real focused verifies have.
     let out = hector_in(
         &dir,
         &["dispatch", "--file", "campaign.yaml", "--bob-cmd", bob.to_str().unwrap()],
@@ -638,6 +661,18 @@ slices:
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "3");
+
+    // Re-dispatch of the fully-landed campaign: every gate is green on base,
+    // so no bob runs, both slices report already_landed, and the exit is 0 —
+    // this used to re-run the landed slice for an empty-diff phantom failure.
+    let out = hector_in(
+        &dir,
+        &["dispatch", "--file", "campaign.yaml", "--bob-cmd", bob.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"already_landed\": 2"), "{stdout}");
+    assert!(stdout.contains("\"failed\": 0"), "{stdout}");
 }
 
 #[test]
@@ -651,12 +686,12 @@ auto_commit: true
 slices:
   - name: doomed
     task: fail
-    verify_cmds: ["true"]
+    verify_cmds: ["test -f x.txt"]
     editable_paths: ["x.txt"]
   - name: downstream
     task: a
     depends_on: [doomed]
-    verify_cmds: ["true"]
+    verify_cmds: ["test -f a.txt"]
     editable_paths: ["a.txt"]
 "#,
     );
@@ -664,7 +699,8 @@ slices:
         &dir,
         &["dispatch", "--file", "campaign.yaml", "--bob-cmd", bob.to_str().unwrap()],
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // A failed campaign fails the process — automation reads the exit code.
+    assert!(!out.status.success(), "failed dispatch must exit non-zero");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("\"converged\": 0"), "{stdout}");
     assert!(stdout.contains("\"skipped\""), "{stdout}");
@@ -682,16 +718,18 @@ name: escalate
 slices:
   - name: c
     task: c
-    verify_cmds: ["true"]
+    verify_cmds: ["test -f c.txt"]
     editable_paths: ["c.txt"]
 "#,
     );
-    // Without --escalate: the tierless attempt fails and stays failed.
+    // Without --escalate: the tierless attempt fails and stays failed —
+    // and the failed dispatch exits non-zero.
     let out = hector_in(
         &dir,
         &["dispatch", "--file", "campaign.yaml", "--bob-cmd", bob.to_str().unwrap()],
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("\"converged\": 0"));
+    assert!(!out.status.success(), "failed dispatch must exit non-zero");
 
     // With --escalate: retried once at tier medium and converges.
     let out = hector_in(
@@ -740,13 +778,75 @@ slices:
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("--propose is incompatible"));
 
-    fs::write(dir.join("dirty.txt"), "uncommitted").unwrap();
+    // Untracked files don't block (real repos always carry .bob/, caches, …),
+    // but a pending change to a TRACKED file does — batch commits would sweep
+    // or collide with it.
+    fs::write(dir.join("dirty.txt"), "untracked is fine").unwrap();
+    let mut campaign = fs::read_to_string(dir.join("campaign.yaml")).unwrap();
+    campaign.push_str("\n# pending edit\n");
+    fs::write(dir.join("campaign.yaml"), campaign).unwrap();
     let out = hector_in(
         &dir,
         &["dispatch", "--file", "campaign.yaml", "--bob-cmd", bob.to_str().unwrap()],
     );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("clean tree"));
+}
+
+#[test]
+fn doctor_reports_config_and_probes_dead_endpoints() {
+    // No config anywhere → says where it looked, exits 0 (not an error state).
+    let dir = tmp_dir("hector-doctor-none");
+    let out = hector_in(&dir, &["doctor"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("none found"), "{stdout}");
+    assert!(stdout.contains("~/.config/hector"), "says where it looked: {stdout}");
+
+    // Config with a dead endpoint: --probe marks it DEAD and exits non-zero.
+    let dir = tmp_dir("hector-doctor-dead");
+    fs::write(
+        dir.join("hector.yaml"),
+        "models:\n  - { name: dead, model: m, base_url: \"http://127.0.0.1:1/v1\" }\n",
+    )
+    .unwrap();
+    let out = hector_in(&dir, &["doctor"]);
+    assert!(out.status.success(), "without --probe, listing is informational");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("dead (default)"));
+
+    let out = hector_in(&dir, &["doctor", "--probe"]);
+    assert!(!out.status.success(), "dead endpoint must fail the probe");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("DEAD"));
+}
+
+#[test]
+fn plan_reads_global_config_fallback() {
+    // No ./hector.yaml, but $HOME/.config/hector/config.yaml sets defaults —
+    // the caps in the emitted campaign prove the fallback was read.
+    let dir = tmp_dir("hector-global-cfg");
+    let cfg_dir = dir.join(".config").join("hector");
+    fs::create_dir_all(&cfg_dir).unwrap();
+    fs::write(
+        cfg_dir.join("config.yaml"),
+        "scope:\n  default_max_changed_files: 7\n  default_max_changed_lines: 777\n",
+    )
+    .unwrap();
+    let out = hector_in(
+        &dir,
+        &[
+            "plan",
+            "--task",
+            "Add a focused behavior.",
+            "--verify",
+            "true",
+            "--editable-path",
+            "src/lib.rs",
+        ],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("max_changed_files: 7"), "{stdout}");
+    assert!(stdout.contains("max_changed_lines: 777"), "{stdout}");
 }
 
 #[test]

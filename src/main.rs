@@ -68,25 +68,35 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-// LLM path: if no verify command provided AND model config exists,
-// hector's model writes a focused test against the provided --spec.
-// The spec (from the frontier model or human) is the authoritative contract.
-// Otherwise, the deterministic path is used.
-// LLM planning path: a --spec is provided but no --verify, so hector writes the
-// focused test against the spec. Without a spec we fall through to the
-// deterministic planner, which returns friendly needs_input guidance rather than
-// hard-erroring — `hector plan --task X` should tell the user what's missing.
-if verify_cmds.iter().all(|c| c.trim().is_empty()) && user_provided_spec {
-    let model_cfg = config::load_default_model()?;
-    if let Some(cfg) = model_cfg {
-        let repo_root = std::env::current_dir()?;
-        let conventions = conventions::detect(&repo_root)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "could not detect repo conventions (Cargo.toml/package.json/etc); \
-                     provide --verify explicitly for deterministic planning"
-                )
-            })?;
+            // LLM planning path: a --spec is provided but no --verify, so hector
+            // writes the focused test against the spec. Without a spec we fall
+            // through to the deterministic planner, which returns friendly
+            // needs_input guidance rather than hard-erroring.
+            let no_verify = verify_cmds.iter().all(|c| c.trim().is_empty());
+            if user_provided_spec && !no_verify {
+                // Surprising-silence fix: providing --verify used to silently
+                // downgrade to deterministic passthrough. Say which path ran.
+                eprintln!(
+                    "hector: --verify provided → deterministic planning (no LLM test-writing). \
+                     Omit --verify to have a configured model write the focused test."
+                );
+            }
+            if no_verify && user_provided_spec {
+                let models = config::load_models()?;
+                if models.is_empty() {
+                    eprintln!(
+                        "hector: no planner models configured (looked in {}) — \
+                         LLM test-writing unavailable, falling back to deterministic planning",
+                        config::CONFIG_SEARCH_HINT
+                    );
+                } else {
+                    let repo_root = std::env::current_dir()?;
+                    let conventions = conventions::detect(&repo_root).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "could not detect repo conventions (Cargo.toml/package.json/etc); \
+                             provide --verify explicitly for deterministic planning"
+                        )
+                    })?;
                     let campaign = planner::plan_with_model(
                         planner::PlanOptions {
                             task,
@@ -106,7 +116,7 @@ if verify_cmds.iter().all(|c| c.trim().is_empty()) && user_provided_spec {
                             },
                             invariants: defaults.invariants,
                         },
-                        &cfg,
+                        &models,
                         &conventions,
                         &repo_root,
                     )
@@ -118,8 +128,6 @@ if verify_cmds.iter().all(|c| c.trim().is_empty()) && user_provided_spec {
                     }
                     return Ok(());
                 }
-                // No model config either — fall through to deterministic plan,
-                // which will return needs_input.
             }
 
             let campaign = planner::plan(planner::PlanOptions {
@@ -140,6 +148,14 @@ if verify_cmds.iter().all(|c| c.trim().is_empty()) && user_provided_spec {
                 },
                 invariants: defaults.invariants,
             })?;
+            // needs_input is not a campaign: never write it to --out (a later
+            // `hector check`/dispatch would choke on it) and never exit 0 —
+            // automation must see that planning did not produce a campaign.
+            if campaign.trim_start().starts_with('{') && campaign.contains("needs_input") {
+                println!("{campaign}");
+                eprintln!("hector: plan needs input — no campaign written");
+                std::process::exit(2);
+            }
             if let Some(path) = out {
                 std::fs::write(path, campaign)?;
             } else {
@@ -208,8 +224,71 @@ if verify_cmds.iter().all(|c| c.trim().is_empty()) && user_provided_spec {
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+            // A failed campaign must fail the process — automation reads the
+            // exit code, not the scoreboard.
+            if !report.succeeded() {
+                anyhow::bail!("dispatch did not fully succeed (see report above)");
+            }
             Ok(())
         }
+        Command::Doctor { probe } => doctor(probe),
         Command::Mcp => mcp::serve().await,
     }
+}
+
+/// `hector doctor [--probe]`: report which config file is in effect and the
+/// planner models in rotation order; with --probe, curl each endpoint's
+/// /models and mark dead entries (non-zero exit if any are dead).
+fn doctor(probe: bool) -> anyhow::Result<()> {
+    let Some(view) = config::doctor_view()? else {
+        println!("config: none found (searched {})", config::CONFIG_SEARCH_HINT);
+        println!("models: none — LLM planning disabled, deterministic path only");
+        return Ok(());
+    };
+    println!("config: {}", view.path.display());
+    if view.models.is_empty() {
+        println!("models: none configured — LLM planning disabled, deterministic path only");
+        return Ok(());
+    }
+    let default = view
+        .default_model
+        .clone()
+        .unwrap_or_else(|| view.models[0].name.clone());
+    let mut dead = 0;
+    for m in &view.models {
+        let marker = if m.name == default { " (default)" } else { "" };
+        if probe {
+            let status = if endpoint_alive(m) {
+                "ALIVE"
+            } else {
+                dead += 1;
+                "DEAD"
+            };
+            println!("model {}{marker}: {} @ {} — {status}", m.name, m.model, m.base_url);
+        } else {
+            println!("model {}{marker}: {} @ {}", m.name, m.model, m.base_url);
+        }
+    }
+    if dead > 0 {
+        anyhow::bail!("{dead} configured model endpoint(s) are dead");
+    }
+    Ok(())
+}
+
+/// GET {base_url}/models with a short timeout — the cheapest liveness check an
+/// OpenAI-compatible endpoint offers.
+fn endpoint_alive(m: &model::ModelCfg) -> bool {
+    let url = format!("{}/models", m.base_url.trim_end_matches('/'));
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-sf", "--max-time", "5", &url]);
+    if let Some(env) = &m.api_key_env {
+        if let Ok(key) = std::env::var(env) {
+            cmd.args(["-H", &format!("Authorization: Bearer {key}")]);
+        }
+    }
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }

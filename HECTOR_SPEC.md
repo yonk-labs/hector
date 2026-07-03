@@ -268,6 +268,24 @@ bob:
 
 Config is project policy. Per-plan CLI/MCP inputs may narrow scope, but should not silently loosen it.
 
+Config is searched at `./hector.yaml` first, then `~/.config/hector/config.yaml`.
+`hector doctor` reports which file is in effect; `--probe` liveness-checks each
+configured model endpoint.
+
+## Failure Contract
+
+Hector never signals success through exit code 0 when its artifact was not
+produced. Specifically:
+
+- `plan` that emits `needs_input` exits 2 and refuses to write `--out`.
+- LLM planning rotates through configured models (default first); looping
+  output, unparseable JSON (after one re-ask), and tests that cannot load
+  (after infra retries) drop the model for the next one. All models failing
+  fails the plan, and any test files a failed model wrote are removed.
+- `dispatch` exits non-zero when any slice failed or an integration gate broke.
+- `dispatch` pre-flights each slice's verify gates: already green on base
+  means `already_landed` — skipped, counted as done, dependents proceed.
+
 ## Implementation Plan
 
 1. Define campaign and finding structs.
