@@ -7,6 +7,7 @@
 
 use crate::schema::{Campaign, Slice};
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -51,10 +52,132 @@ pub struct SliceResult {
     changed_files: Vec<String>,
     model: Option<String>,
     error: Option<String>,
+    /// Set when --escalate re-ran this slice at a higher tier after a failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    escalated_to: Option<String>,
     /// Candidate diff from bob's propose-mode run, applied sequentially after
     /// all parallel builds finish. Internal — not part of the JSON report.
     #[serde(skip)]
     diff: String,
+}
+
+/// Uniform error/skip result constructor.
+fn error_result(name: &str, msg: String) -> SliceResult {
+    SliceResult {
+        name: name.to_string(),
+        status: "error".into(),
+        stop_reason: None,
+        iterations: None,
+        applied: false,
+        wall_secs: 0,
+        changed_files: vec![],
+        model: None,
+        error: Some(msg),
+        escalated_to: None,
+        diff: String::new(),
+    }
+}
+
+/// Fixed escalation ladder mirroring bob's tiers. An unset tier (bob's
+/// configured default) escalates to medium as the first meaningful bump;
+/// frontier has nowhere to go.
+fn next_tier(current: Option<&str>) -> Option<&'static str> {
+    match current {
+        None | Some("cheap") => Some("medium"),
+        Some("medium") => Some("large"),
+        Some("large") => Some("frontier"),
+        _ => None,
+    }
+}
+
+/// Run a slice; with `escalate`, retry ONCE at the next tier up when the first
+/// attempt doesn't converge. The escalation is loud (stderr + `escalated_to`
+/// in the report) — hector surfaces autonomy, it never hides it.
+async fn run_slice_escalating(
+    slice: Slice,
+    bob_cmd: &str,
+    campaign_dir: &Path,
+    slice_name: &str,
+    escalate: bool,
+) -> SliceResult {
+    let sr = run_slice(&slice, bob_cmd, campaign_dir, slice_name)
+        .await
+        .unwrap_or_else(|e| error_result(slice_name, e.to_string()));
+    if sr.status == "converged" || !escalate {
+        return sr;
+    }
+    let Some(tier) = next_tier(slice.tier.as_deref()) else {
+        return sr;
+    };
+    eprintln!(
+        "hector dispatch: '{slice_name}' {} at tier {} — escalating to '{tier}' and retrying",
+        sr.status,
+        slice.tier.as_deref().unwrap_or("(default)")
+    );
+    let mut retry_slice = slice;
+    retry_slice.tier = Some(tier.to_string());
+    let mut retry = run_slice(&retry_slice, bob_cmd, campaign_dir, slice_name)
+        .await
+        .unwrap_or_else(|e| error_result(slice_name, e.to_string()));
+    retry.escalated_to = Some(tier.to_string());
+    retry
+}
+
+/// Group slice indices into dependency-ordered batches (topological levels).
+/// No depends_on anywhere → one flat batch (today's behavior). Errors on
+/// duplicate names, unknown dependencies, and cycles.
+fn batch_slices(slices: &[Slice]) -> anyhow::Result<Vec<Vec<usize>>> {
+    let n = slices.len();
+    if slices.iter().all(|s| s.depends_on.is_empty()) {
+        return Ok(vec![(0..n).collect()]);
+    }
+
+    let names: Vec<String> = slices
+        .iter()
+        .enumerate()
+        .map(|(i, s)| s.name.clone().unwrap_or_else(|| format!("slice-{i}")))
+        .collect();
+    let mut idx_of: HashMap<&str, usize> = HashMap::new();
+    for (i, name) in names.iter().enumerate() {
+        if idx_of.insert(name.as_str(), i).is_some() {
+            anyhow::bail!("duplicate slice name '{name}' — depends_on needs unique names");
+        }
+    }
+    for (i, s) in slices.iter().enumerate() {
+        for d in &s.depends_on {
+            if !idx_of.contains_key(d.as_str()) {
+                anyhow::bail!("slice '{}' depends on unknown slice '{d}'", names[i]);
+            }
+        }
+    }
+
+    let mut placed = vec![false; n];
+    let mut remaining = n;
+    let mut batches = Vec::new();
+    while remaining > 0 {
+        let ready: Vec<usize> = (0..n)
+            .filter(|&i| {
+                !placed[i]
+                    && slices[i]
+                        .depends_on
+                        .iter()
+                        .all(|d| placed[idx_of[d.as_str()]])
+            })
+            .collect();
+        if ready.is_empty() {
+            let stuck: Vec<&str> = (0..n)
+                .filter(|&i| !placed[i])
+                .map(|i| names[i].as_str())
+                .collect();
+            anyhow::bail!("dependency cycle among slices: {}", stuck.join(", "));
+        }
+        for &i in &ready {
+            placed[i] = true;
+        }
+        remaining -= ready.len();
+        batches.push(ready);
+    }
+    Ok(batches)
 }
 
 /// Dispatch all slices in a campaign to bob in parallel.
@@ -63,6 +186,7 @@ pub async fn run_campaign(
     jobs: usize,
     bob_cmd: &str,
     propose: bool,
+    escalate: bool,
 ) -> anyhow::Result<DispatchReport> {
     let text = std::fs::read_to_string(campaign_path)?;
     let campaign: Campaign = serde_yaml::from_str(&text)?;
@@ -73,16 +197,38 @@ pub async fn run_campaign(
         anyhow::bail!("campaign has no slices");
     }
 
-    // Parallel dispatch + sequential merge assumes slices touch disjoint paths.
-    // Overlapping editable_paths would race semantically (last diff wins) and
-    // is fine only in sequential `bob campaign` — so enforce it here, not in
-    // `hector check`.
-    if let Some((a, b, path)) = overlapping_slices(&campaign.slices) {
-        anyhow::bail!(
-            "slices '{a}' and '{b}' have overlapping editable_paths ('{path}') — \
-             parallel dispatch requires disjoint paths; run them in separate \
-             campaigns or via sequential `bob campaign`"
-        );
+    // Dependency-ordered batches. One batch (no depends_on anywhere) is the
+    // flat parallel dispatch this module always did. Multiple batches require
+    // committing between them: bob builds each slice in a worktree branched
+    // from HEAD, so a later batch only sees earlier results via a commit.
+    let batches = batch_slices(&campaign.slices)?;
+    let deps_mode = batches.len() > 1;
+    if deps_mode {
+        if propose {
+            anyhow::bail!(
+                "--propose is incompatible with depends_on: dependent batches \
+                 must commit so later slices build on earlier results"
+            );
+        }
+        if !campaign.auto_commit {
+            anyhow::bail!(
+                "depends_on requires auto_commit: true — dispatch commits each \
+                 batch so the next one builds on it"
+            );
+        }
+    }
+
+    // Slices that run CONCURRENTLY must touch disjoint paths — overlapping
+    // editable_paths would race semantically (last diff wins). Across batches
+    // overlap is fine: the later slice builds on the committed earlier one.
+    for batch in &batches {
+        if let Some((a, b, path)) = overlapping_slices(&campaign.slices, batch) {
+            anyhow::bail!(
+                "slices '{a}' and '{b}' run in the same parallel batch but have \
+                 overlapping editable_paths ('{path}') — make one depend_on the \
+                 other, or run them via sequential `bob campaign`"
+            );
+        }
     }
 
     // Union of slice gates + campaign-level gates BEFORE consuming slices —
@@ -92,74 +238,119 @@ pub async fn run_campaign(
 
     let max_jobs = jobs.min(total).max(1);
     eprintln!(
-        "hector dispatch: {} slices, {} jobs, bob='{}'",
-        total, max_jobs, bob_cmd
+        "hector dispatch: {} slices, {} batch(es), {} jobs, bob='{}'",
+        total,
+        batches.len(),
+        max_jobs,
+        bob_cmd
     );
+
+    let apply_dir = std::env::current_dir()?;
+    if deps_mode {
+        let dirty = git(&apply_dir, &["status", "--porcelain"])
+            .map_err(|e| anyhow::anyhow!("git status failed: {e}"))?;
+        if !dirty.trim().is_empty() {
+            anyhow::bail!(
+                "depends_on dispatch commits between batches — start from a \
+                 clean tree (git status shows pending changes)"
+            );
+        }
+    }
 
     let semaphore = Arc::new(Semaphore::new(max_jobs));
     let start = Instant::now();
-    let mut handles = Vec::new();
+    let mut slice_store: Vec<Option<Slice>> = campaign.slices.into_iter().map(Some).collect();
+    let mut slices: Vec<SliceResult> = Vec::new();
+    let mut failed_names: HashSet<String> = HashSet::new();
+    let mut any_applied = false;
 
-    for (idx, slice) in campaign.slices.into_iter().enumerate() {
-        let permit = semaphore.clone();
-        let bob = bob_cmd.to_string();
-        let campaign_dir = std::env::current_dir()?;
-        let slice_name = slice.name.clone().unwrap_or_else(|| format!("slice-{idx}"));
-        handles.push(tokio::spawn(async move {
-            let _permit = permit.acquire().await.unwrap();
-            eprintln!("hector dispatch: starting '{slice_name}'");
-            let slice_start = Instant::now();
-            let result = run_slice(&slice, &bob, &campaign_dir, &slice_name).await;
-            let wall = slice_start.elapsed().as_secs();
-            let mut sr = result.unwrap_or_else(|e| SliceResult {
-                name: slice_name.clone(),
-                status: "error".into(),
-                stop_reason: None,
-                iterations: None,
-                applied: false,
-                wall_secs: wall,
-                changed_files: vec![],
-                model: None,
-                error: Some(e.to_string()),
-                diff: String::new(),
-            });
-            sr.wall_secs = wall;
-            eprintln!(
-                "hector dispatch: '{slice_name}' done: {} in {}s",
-                sr.status, sr.wall_secs
-            );
-            sr
-        }));
-    }
+    for (batch_no, batch) in batches.iter().enumerate() {
+        let mut handles = Vec::new();
+        for &idx in batch {
+            let slice = slice_store[idx].take().expect("each slice dispatched once");
+            let slice_name = slice.name.clone().unwrap_or_else(|| format!("slice-{idx}"));
 
-    let mut slices = Vec::new();
-    for handle in handles {
-        match handle.await {
-            Ok(sr) => slices.push(sr),
-            // A panicked task must not abort the whole dispatch — record it.
-            Err(e) => slices.push(SliceResult {
-                name: "(panicked)".into(),
-                status: "error".into(),
-                stop_reason: None,
-                iterations: None,
-                applied: false,
-                wall_secs: 0,
-                changed_files: vec![],
-                model: None,
-                error: Some(format!("dispatch task panicked: {e}")),
-                diff: String::new(),
-            }),
+            // A failed dependency explicitly fails its downstream chain.
+            if let Some(dep) = slice.depends_on.iter().find(|d| failed_names.contains(*d)) {
+                eprintln!("hector dispatch: skipping '{slice_name}' — dependency '{dep}' failed");
+                failed_names.insert(slice_name.clone());
+                let mut sr = error_result(&slice_name, format!("dependency '{dep}' failed"));
+                sr.status = "skipped".into();
+                slices.push(sr);
+                continue;
+            }
+
+            let permit = semaphore.clone();
+            let bob = bob_cmd.to_string();
+            let campaign_dir = apply_dir.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit.acquire().await.unwrap();
+                eprintln!("hector dispatch: starting '{slice_name}'");
+                let slice_start = Instant::now();
+                let mut sr =
+                    run_slice_escalating(slice, &bob, &campaign_dir, &slice_name, escalate).await;
+                sr.wall_secs = slice_start.elapsed().as_secs();
+                eprintln!(
+                    "hector dispatch: '{slice_name}' done: {} in {}s",
+                    sr.status, sr.wall_secs
+                );
+                sr
+            }));
         }
+
+        let mut batch_results = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(sr) => batch_results.push(sr),
+                // A panicked task must not abort the whole dispatch — record it.
+                Err(e) => batch_results
+                    .push(error_result("(panicked)", format!("dispatch task panicked: {e}"))),
+            }
+        }
+
+        if deps_mode {
+            // Merge + commit this batch so the next batch's bob worktrees
+            // (branched from HEAD) build on these results.
+            let mut landed: Vec<String> = Vec::new();
+            for sr in &mut batch_results {
+                if sr.status == "converged" && !sr.diff.trim().is_empty() {
+                    match apply_diff(&apply_dir, &sr.diff) {
+                        Ok(()) => {
+                            sr.applied = true;
+                            landed.push(sr.name.clone());
+                        }
+                        Err(e) => {
+                            sr.status = "apply_failed".into();
+                            sr.error = Some(format!("git apply failed: {e}"));
+                        }
+                    }
+                }
+            }
+            if !landed.is_empty() {
+                any_applied = true;
+                let msg = format!("hector dispatch: batch {} ({})", batch_no + 1, landed.join(", "));
+                git(&apply_dir, &["commit", "-m", &msg])
+                    .map_err(|e| anyhow::anyhow!("commit of batch {} failed: {e}", batch_no + 1))?;
+            }
+            for sr in &batch_results {
+                if sr.status != "converged" {
+                    failed_names.insert(sr.name.clone());
+                }
+            }
+        }
+        slices.extend(batch_results);
     }
 
     // MERGE PHASE. Each slice built in propose mode in its own isolated worktree
     // (parallel, no contention). Bob's apply writes to the shared main repo, and
     // parallel git ops race on `.git/index.lock` — so we merge sequentially here.
+    //   deps_mode: batches already merged + committed above; just verify.
     //   --propose: merge into a throwaway worktree, verify there, write the diff
     //              for inspection, discard. The working tree is untouched.
     //   default:   merge into the working tree (staged), then verify.
-    let apply_dir = std::env::current_dir()?;
-    let (integration, proposed_diff) = if propose {
+    let (integration, proposed_diff) = if deps_mode {
+        (run_combined_verify(&apply_dir, any_applied, &combined_verify), None)
+    } else if propose {
         propose_in_scratch(&apply_dir, &mut slices, &combined_verify)
     } else {
         for sr in &mut slices {
@@ -212,18 +403,20 @@ fn collect_combined_verify(campaign: &Campaign) -> Vec<String> {
     gates
 }
 
-/// Find the first pair of slices whose editable_paths overlap (equal, or one is
-/// a component-wise prefix of the other, e.g. `src/` contains `src/a.rs`).
-/// Returns (slice_a, slice_b, offending path) for the error message.
-fn overlapping_slices(slices: &[Slice]) -> Option<(String, String, String)> {
+/// Find the first pair of slices WITHIN `batch` whose editable_paths overlap
+/// (equal, or one is a component-wise prefix of the other, e.g. `src/`
+/// contains `src/a.rs`). Only concurrent slices need disjoint paths — across
+/// batches the later slice builds on the earlier one's commit. Returns
+/// (slice_a, slice_b, offending path) for the error message.
+fn overlapping_slices(slices: &[Slice], batch: &[usize]) -> Option<(String, String, String)> {
     let name = |i: usize| {
         slices[i]
             .name
             .clone()
             .unwrap_or_else(|| format!("slice-{i}"))
     };
-    for i in 0..slices.len() {
-        for j in (i + 1)..slices.len() {
+    for (pos, &i) in batch.iter().enumerate() {
+        for &j in &batch[pos + 1..] {
             for a in &slices[i].editable_paths {
                 for b in &slices[j].editable_paths {
                     if paths_overlap(a, b) {
@@ -510,6 +703,7 @@ async fn run_slice(
         changed_files,
         model,
         error: None,
+        escalated_to: None,
         diff,
     })
 }
@@ -585,7 +779,7 @@ slices:
             slice_with_paths("a", &["src/a.rs", "src/a_helper.rs"]),
             slice_with_paths("b", &["src/b.rs"]),
         ];
-        assert!(overlapping_slices(&slices).is_none());
+        assert!(overlapping_slices(&slices, &[0, 1]).is_none());
     }
 
     #[test]
@@ -594,8 +788,12 @@ slices:
             slice_with_paths("a", &["src/x.rs"]),
             slice_with_paths("b", &["src/x.rs"]),
         ];
-        let (a, b, p) = overlapping_slices(&slices).unwrap();
+        let (a, b, p) = overlapping_slices(&slices, &[0, 1]).unwrap();
         assert_eq!((a.as_str(), b.as_str(), p.as_str()), ("a", "b", "src/x.rs"));
+        // Same slices in DIFFERENT batches don't collide — the check is
+        // per-parallel-batch only.
+        assert!(overlapping_slices(&slices, &[0]).is_none());
+        assert!(overlapping_slices(&slices, &[1]).is_none());
     }
 
     #[test]
@@ -605,13 +803,64 @@ slices:
             slice_with_paths("dir", &["./src"]),
             slice_with_paths("file", &["src/a.rs"]),
         ];
-        assert!(overlapping_slices(&slices).is_some());
+        assert!(overlapping_slices(&slices, &[0, 1]).is_some());
         // But a sibling directory does not.
         let ok = vec![
             slice_with_paths("dir", &["src/"]),
             slice_with_paths("other", &["tests/a.rs"]),
         ];
-        assert!(overlapping_slices(&ok).is_none());
+        assert!(overlapping_slices(&ok, &[0, 1]).is_none());
+    }
+
+    fn slice_with_deps(name: &str, deps: &[&str]) -> Slice {
+        Slice {
+            name: Some(name.into()),
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_deps_is_one_flat_batch() {
+        let slices = vec![slice_with_deps("a", &[]), slice_with_deps("b", &[])];
+        assert_eq!(batch_slices(&slices).unwrap(), vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn chain_and_diamond_batch_in_dependency_order() {
+        // a → (b, c) → d: three levels, b and c parallel in the middle.
+        let slices = vec![
+            slice_with_deps("a", &[]),
+            slice_with_deps("b", &["a"]),
+            slice_with_deps("c", &["a"]),
+            slice_with_deps("d", &["b", "c"]),
+        ];
+        assert_eq!(
+            batch_slices(&slices).unwrap(),
+            vec![vec![0], vec![1, 2], vec![3]]
+        );
+    }
+
+    #[test]
+    fn unknown_dep_and_cycle_and_dup_names_error() {
+        let unknown = vec![slice_with_deps("a", &["ghost"])];
+        assert!(batch_slices(&unknown).unwrap_err().to_string().contains("unknown slice"));
+
+        let cycle = vec![slice_with_deps("a", &["b"]), slice_with_deps("b", &["a"])];
+        assert!(batch_slices(&cycle).unwrap_err().to_string().contains("cycle"));
+
+        let dup = vec![slice_with_deps("a", &[]), slice_with_deps("a", &["a"])];
+        assert!(batch_slices(&dup).unwrap_err().to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn tier_ladder_escalates_and_tops_out() {
+        assert_eq!(next_tier(None), Some("medium"));
+        assert_eq!(next_tier(Some("cheap")), Some("medium"));
+        assert_eq!(next_tier(Some("medium")), Some("large"));
+        assert_eq!(next_tier(Some("large")), Some("frontier"));
+        assert_eq!(next_tier(Some("frontier")), None);
+        assert_eq!(next_tier(Some("weird")), None);
     }
 
     #[test]

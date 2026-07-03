@@ -105,6 +105,11 @@ pub enum Command {
         /// diff for inspection — do NOT modify the working tree.
         #[arg(long)]
         propose: bool,
+        /// When a slice fails to converge, retry it ONCE at the next model
+        /// tier up (cheap→medium→large→frontier). Opt-in autonomy: every
+        /// escalation is logged and recorded in the report.
+        #[arg(long)]
+        escalate: bool,
     },
     /// Run the stdio MCP server.
     Mcp,

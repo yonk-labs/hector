@@ -194,10 +194,15 @@ if verify_cmds.iter().all(|c| c.trim().is_empty()) && spec_text.is_some() {
             std::fs::write(path, config::DEFAULT_CONFIG)?;
             Ok(())
         }
-        Command::Dispatch { file, jobs, bob_cmd, propose } => {
-            let report =
-                dispatch::run_campaign(&file, jobs, bob_cmd.as_deref().unwrap_or("bob"), propose)
-                    .await?;
+        Command::Dispatch { file, jobs, bob_cmd, propose, escalate } => {
+            let report = dispatch::run_campaign(
+                &file,
+                jobs,
+                bob_cmd.as_deref().unwrap_or("bob"),
+                propose,
+                escalate,
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }

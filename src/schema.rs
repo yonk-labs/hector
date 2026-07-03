@@ -25,7 +25,7 @@ pub struct Campaign {
     pub slices: Vec<Slice>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Slice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -51,6 +51,12 @@ pub struct Slice {
     /// `hector dispatch` (passes `--tier`) and `bob campaign`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// Slice names this slice depends on. Consumed only by `hector dispatch`,
+    /// which runs dependency-ordered batches and commits between them so later
+    /// batches build on earlier results; `bob campaign` (sequential anyway)
+    /// ignores it. Requires campaign `auto_commit: true`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 #[cfg(test)]

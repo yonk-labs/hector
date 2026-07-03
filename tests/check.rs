@@ -555,3 +555,196 @@ fn plan_with_symbol_degrades_gracefully_when_maple_missing() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("needs_input"));
 }
+
+// ---- dispatch e2e with a fake bob -----------------------------------------
+// A tiny sh script stands in for bob: task "a" converges with a diff adding
+// a.txt; task "b" converges ONLY if a.txt already exists in the repo (proving
+// dependency ordering + the between-batch commit); task "c" converges only
+// when a --tier flag is present (proving --escalate retries at a higher tier);
+// task "fail" never converges.
+const FAKE_BOB: &str = r#"#!/bin/sh
+task="$3"
+case "$*" in *--tier*) tiered=1;; *) tiered=0;; esac
+emit_ok() {
+  f="$1"
+  printf '{"status":"converged","changed_files":["%s"],"final_diff":"diff --git a/%s b/%s\\nnew file mode 100644\\n--- /dev/null\\n+++ b/%s\\n@@ -0,0 +1 @@\\n+hello\\n"}' "$f" "$f" "$f" "$f"
+}
+emit_fail() { printf '{"status":"not_converged","stop_reason":"JudgeRejected","final_diff":""}'; }
+case "$task" in
+  a) emit_ok a.txt ;;
+  b) if [ -f a.txt ]; then emit_ok b.txt; else emit_fail; fi ;;
+  c) if [ "$tiered" = 1 ]; then emit_ok c.txt; else emit_fail; fi ;;
+  *) emit_fail ;;
+esac
+"#;
+
+fn init_dispatch_repo(dir: &std::path::Path, campaign: &str) -> std::path::PathBuf {
+    let git = |args: &[&str]| {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@test"]);
+    git(&["config", "user.name", "test"]);
+    fs::write(dir.join("campaign.yaml"), campaign).unwrap();
+    let bob = dir.join("fake-bob.sh");
+    fs::write(&bob, FAKE_BOB).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bob, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "init"]);
+    bob
+}
+
+#[test]
+fn dispatch_runs_dependent_batches_in_order_and_commits() {
+    let dir = tmp_dir("hector-dispatch-deps");
+    let bob = init_dispatch_repo(
+        &dir,
+        r#"
+name: deps
+auto_commit: true
+slices:
+  - name: a
+    task: a
+    verify_cmds: ["true"]
+    editable_paths: ["a.txt"]
+  - name: b
+    task: b
+    depends_on: [a]
+    verify_cmds: ["true"]
+    editable_paths: ["a.txt", "b.txt"]
+"#,
+    );
+    // Note: b's editable_paths overlap a's — legal BECAUSE they're in
+    // different batches.
+    let out = hector_in(
+        &dir,
+        &["dispatch", "--file", "campaign.yaml", "--bob-cmd", bob.to_str().unwrap()],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    // b converged — which is only possible if a.txt was committed before b ran.
+    assert!(dir.join("a.txt").exists() && dir.join("b.txt").exists(), "{stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"converged\": 2"), "{stdout}");
+    // init + one commit per batch = 3.
+    let count = Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "3");
+}
+
+#[test]
+fn dispatch_skips_dependents_of_failed_slices() {
+    let dir = tmp_dir("hector-dispatch-skip");
+    let bob = init_dispatch_repo(
+        &dir,
+        r#"
+name: skip
+auto_commit: true
+slices:
+  - name: doomed
+    task: fail
+    verify_cmds: ["true"]
+    editable_paths: ["x.txt"]
+  - name: downstream
+    task: a
+    depends_on: [doomed]
+    verify_cmds: ["true"]
+    editable_paths: ["a.txt"]
+"#,
+    );
+    let out = hector_in(
+        &dir,
+        &["dispatch", "--file", "campaign.yaml", "--bob-cmd", bob.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"converged\": 0"), "{stdout}");
+    assert!(stdout.contains("\"skipped\""), "{stdout}");
+    assert!(stdout.contains("dependency 'doomed' failed"), "{stdout}");
+    assert!(!dir.join("a.txt").exists(), "downstream slice must not have run");
+}
+
+#[test]
+fn dispatch_escalates_tier_on_failure_when_asked() {
+    let dir = tmp_dir("hector-dispatch-escalate");
+    let bob = init_dispatch_repo(
+        &dir,
+        r#"
+name: escalate
+slices:
+  - name: c
+    task: c
+    verify_cmds: ["true"]
+    editable_paths: ["c.txt"]
+"#,
+    );
+    // Without --escalate: the tierless attempt fails and stays failed.
+    let out = hector_in(
+        &dir,
+        &["dispatch", "--file", "campaign.yaml", "--bob-cmd", bob.to_str().unwrap()],
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"converged\": 0"));
+
+    // With --escalate: retried once at tier medium and converges.
+    let out = hector_in(
+        &dir,
+        &[
+            "dispatch", "--file", "campaign.yaml",
+            "--bob-cmd", bob.to_str().unwrap(),
+            "--escalate",
+        ],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"converged\": 1"), "{stdout}");
+    assert!(stdout.contains("\"escalated_to\": \"medium\""), "{stdout}");
+    assert!(dir.join("c.txt").exists());
+}
+
+#[test]
+fn dispatch_rejects_depends_on_with_propose_or_dirty_tree() {
+    let dir = tmp_dir("hector-dispatch-guards");
+    let bob = init_dispatch_repo(
+        &dir,
+        r#"
+name: guards
+auto_commit: true
+slices:
+  - name: a
+    task: a
+    verify_cmds: ["true"]
+    editable_paths: ["a.txt"]
+  - name: b
+    task: b
+    depends_on: [a]
+    verify_cmds: ["true"]
+    editable_paths: ["b.txt"]
+"#,
+    );
+    let out = hector_in(
+        &dir,
+        &[
+            "dispatch", "--file", "campaign.yaml",
+            "--bob-cmd", bob.to_str().unwrap(),
+            "--propose",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--propose is incompatible"));
+
+    fs::write(dir.join("dirty.txt"), "uncommitted").unwrap();
+    let out = hector_in(
+        &dir,
+        &["dispatch", "--file", "campaign.yaml", "--bob-cmd", bob.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("clean tree"));
+}

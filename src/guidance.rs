@@ -17,6 +17,8 @@ The **deterministic verify gate is the authority** — it decides pass/fail. Abe
 - `scope_caps`: max changed files and max changed lines.
 - `dependency_policy`: explicit yes/no for dependency and lockfile edits.
 - `review_policy`: when to ask Abe before Bob, and what Bob result should be accepted, split, or sent back.
+- `depends_on` (optional, `hector dispatch` only): slice names this slice builds on. Dispatch runs dependency-ordered batches and commits between them; slices in the same batch must have disjoint editable_paths, dependent slices may overlap. Requires campaign `auto_commit: true`.
+- Campaign-level `verify_cmds` (optional, `hector dispatch` only): integration gates (full suite, typecheck) run once against the merged tree after all slices land.
 
 ## Successful Slice Shape
 
