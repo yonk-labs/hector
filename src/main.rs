@@ -71,6 +71,7 @@ if verify_cmds.iter().all(|c| c.trim().is_empty()) && spec_text.is_some() {
                             } else {
                                 defaults.auto_commit
                             },
+                            invariants: defaults.invariants,
                         },
                         &cfg,
                         &conventions,
@@ -104,6 +105,7 @@ if verify_cmds.iter().all(|c| c.trim().is_empty()) && spec_text.is_some() {
                 } else {
                     defaults.auto_commit
                 },
+                invariants: defaults.invariants,
             })?;
             if let Some(path) = out {
                 std::fs::write(path, campaign)?;

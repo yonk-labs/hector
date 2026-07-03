@@ -15,6 +15,12 @@ pub struct Campaign {
     pub name: Option<String>,
     #[serde(default)]
     pub auto_commit: bool,
+    /// Campaign-level integration gates (e.g. `npm run test:all`, typecheck)
+    /// not tied to any single slice. Consumed only by `hector dispatch`, which
+    /// runs them against the merged tree after all slices apply; `bob campaign`
+    /// ignores unknown top-level fields, so this stays contract-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_cmds: Option<Vec<String>>,
     #[serde(default)]
     pub slices: Vec<Slice>,
 }
@@ -59,6 +65,7 @@ mod tests {
         let c = Campaign {
             name: Some("c".into()),
             auto_commit: false,
+            verify_cmds: None,
             slices: vec![Slice {
                 name: Some("s".into()),
                 task: Some("do x".into()),
@@ -76,6 +83,19 @@ mod tests {
         }
         // Unset optionals are omitted, not emitted as null.
         assert!(!yaml.contains("null"), "should not emit nulls:\n{yaml}");
+    }
+
+    /// Campaign-level verify_cmds (hector-dispatch-only) round-trips and is
+    /// omitted from YAML when unset — bob never sees a spurious field.
+    #[test]
+    fn campaign_verify_cmds_round_trips_and_omits_when_none() {
+        let yaml = "name: c\nverify_cmds: [npm run test:all]\nslices:\n  - task: t\n";
+        let c: Campaign = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(c.verify_cmds.as_deref(), Some(&["npm run test:all".to_string()][..]));
+
+        let none = Campaign { name: Some("c".into()), ..Default::default() };
+        let emitted = serde_yaml::to_string(&none).unwrap();
+        assert!(!emitted.contains("verify_cmds"), "unset field must be omitted:\n{emitted}");
     }
 
     #[test]

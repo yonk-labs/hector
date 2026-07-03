@@ -122,6 +122,11 @@ fn plan_campaign(p: PlanCampaignParams) -> anyhow::Result<String> {
             .judge_policy
             .unwrap_or_else(|| "retry_on_fail".to_string()),
         auto_commit: p.auto_commit.unwrap_or(true),
+        // Same standing invariants the CLI path injects — MCP-planned
+        // campaigns must not silently skip the house rules.
+        invariants: crate::config::load_plan_defaults()
+            .map(|d| d.invariants)
+            .unwrap_or_default(),
     })?;
 
     if planned.trim_start().starts_with('{') {

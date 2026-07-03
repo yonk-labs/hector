@@ -14,6 +14,11 @@ judge:
   default_policy: retry_on_fail
 bob:
   campaign_auto_commit: true
+# Standing constraints appended to every generated slice spec.
+# invariants:
+#   - never weaken or delete an existing assertion
+#   - no new dependencies
+#   - pure functions stay pure; state stays JSON-plain
 # models:
 #   - { name: qwen,    model: \"Intel/Qwen3-Coder-Next-int4-AutoRound\", base_url: \"http://192.168.1.193:8000/v1\" }
 #   - { name: gemma,   model: \"cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit\", base_url: \"http://192.168.1.133:8000/v1\" }
@@ -27,6 +32,9 @@ pub struct PlanDefaults {
     pub max_changed_lines: u64,
     pub judge_policy: String,
     pub auto_commit: bool,
+    /// Standing constraints ("never weaken an assertion", "no new deps")
+    /// appended to every generated slice spec.
+    pub invariants: Vec<String>,
 }
 
 impl PlanDefaults {
@@ -42,6 +50,7 @@ impl PlanDefaults {
                 .unwrap_or(self.max_changed_lines),
             judge_policy: cfg.judge.default_policy.unwrap_or(self.judge_policy),
             auto_commit: cfg.bob.campaign_auto_commit.unwrap_or(self.auto_commit),
+            invariants: cfg.invariants,
         }
     }
 }
@@ -53,6 +62,7 @@ impl Default for PlanDefaults {
             max_changed_lines: 160,
             judge_policy: "retry_on_fail".to_string(),
             auto_commit: true,
+            invariants: Vec::new(),
         }
     }
 }
@@ -71,6 +81,8 @@ struct HectorConfig {
     default_model: Option<String>,
     #[serde(default)]
     review: ReviewConfig,
+    #[serde(default)]
+    invariants: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

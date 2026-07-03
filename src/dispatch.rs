@@ -66,25 +66,29 @@ pub async fn run_campaign(
 ) -> anyhow::Result<DispatchReport> {
     let text = std::fs::read_to_string(campaign_path)?;
     let campaign: Campaign = serde_yaml::from_str(&text)?;
-    let campaign_name = campaign.name.unwrap_or_else(|| "campaign".into());
+    let campaign_name = campaign.name.clone().unwrap_or_else(|| "campaign".into());
     let total = campaign.slices.len();
 
     if total == 0 {
         anyhow::bail!("campaign has no slices");
     }
 
-    // Collect the union of verify gates BEFORE consuming slices — these re-run
-    // against the merged tree after apply to catch cross-slice integration breaks.
-    let mut combined_verify: Vec<String> = campaign
-        .slices
-        .iter()
-        .filter_map(|s| s.verify_cmds.as_ref())
-        .flatten()
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
-        .collect();
-    combined_verify.sort();
-    combined_verify.dedup();
+    // Parallel dispatch + sequential merge assumes slices touch disjoint paths.
+    // Overlapping editable_paths would race semantically (last diff wins) and
+    // is fine only in sequential `bob campaign` — so enforce it here, not in
+    // `hector check`.
+    if let Some((a, b, path)) = overlapping_slices(&campaign.slices) {
+        anyhow::bail!(
+            "slices '{a}' and '{b}' have overlapping editable_paths ('{path}') — \
+             parallel dispatch requires disjoint paths; run them in separate \
+             campaigns or via sequential `bob campaign`"
+        );
+    }
+
+    // Union of slice gates + campaign-level gates BEFORE consuming slices —
+    // these re-run against the merged tree after apply to catch cross-slice
+    // integration breaks.
+    let combined_verify = collect_combined_verify(&campaign);
 
     let max_jobs = jobs.min(total).max(1);
     eprintln!(
@@ -188,6 +192,66 @@ pub async fn run_campaign(
         integration,
         proposed_diff,
     })
+}
+
+/// Union of every slice's verify gates plus the campaign-level gates, deduped.
+/// Campaign-level `verify_cmds` covers integration gates (full suite,
+/// typecheck) that belong to no single slice.
+fn collect_combined_verify(campaign: &Campaign) -> Vec<String> {
+    let mut gates: Vec<String> = campaign
+        .slices
+        .iter()
+        .filter_map(|s| s.verify_cmds.as_ref())
+        .chain(campaign.verify_cmds.as_ref())
+        .flatten()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    gates.sort();
+    gates.dedup();
+    gates
+}
+
+/// Find the first pair of slices whose editable_paths overlap (equal, or one is
+/// a component-wise prefix of the other, e.g. `src/` contains `src/a.rs`).
+/// Returns (slice_a, slice_b, offending path) for the error message.
+fn overlapping_slices(slices: &[Slice]) -> Option<(String, String, String)> {
+    let name = |i: usize| {
+        slices[i]
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("slice-{i}"))
+    };
+    for i in 0..slices.len() {
+        for j in (i + 1)..slices.len() {
+            for a in &slices[i].editable_paths {
+                for b in &slices[j].editable_paths {
+                    if paths_overlap(a, b) {
+                        return Some((name(i), name(j), a.clone()));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True when the paths are equal or one contains the other, compared by
+/// normalized components so `src/`, `./src` and `src/a.rs` all collide.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let comps = |p: &str| -> Vec<String> {
+        Path::new(p)
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect()
+    };
+    let (ca, cb) = (comps(a), comps(b));
+    if ca.is_empty() || cb.is_empty() {
+        return false;
+    }
+    let n = ca.len().min(cb.len());
+    ca[..n] == cb[..n]
 }
 
 /// Run the combined verify gates against a merged tree at `repo`. `merged` is
@@ -505,6 +569,63 @@ slices:
         let yaml = "name: empty\nslices: []";
         let campaign: Campaign = serde_yaml::from_str(yaml).unwrap();
         assert!(campaign.slices.is_empty());
+    }
+
+    fn slice_with_paths(name: &str, paths: &[&str]) -> Slice {
+        Slice {
+            name: Some(name.into()),
+            editable_paths: paths.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disjoint_paths_pass() {
+        let slices = vec![
+            slice_with_paths("a", &["src/a.rs", "src/a_helper.rs"]),
+            slice_with_paths("b", &["src/b.rs"]),
+        ];
+        assert!(overlapping_slices(&slices).is_none());
+    }
+
+    #[test]
+    fn identical_paths_collide() {
+        let slices = vec![
+            slice_with_paths("a", &["src/x.rs"]),
+            slice_with_paths("b", &["src/x.rs"]),
+        ];
+        let (a, b, p) = overlapping_slices(&slices).unwrap();
+        assert_eq!((a.as_str(), b.as_str(), p.as_str()), ("a", "b", "src/x.rs"));
+    }
+
+    #[test]
+    fn directory_containing_file_collides() {
+        // `src/` contains `src/a.rs`; `./src` normalizes to `src`.
+        let slices = vec![
+            slice_with_paths("dir", &["./src"]),
+            slice_with_paths("file", &["src/a.rs"]),
+        ];
+        assert!(overlapping_slices(&slices).is_some());
+        // But a sibling directory does not.
+        let ok = vec![
+            slice_with_paths("dir", &["src/"]),
+            slice_with_paths("other", &["tests/a.rs"]),
+        ];
+        assert!(overlapping_slices(&ok).is_none());
+    }
+
+    #[test]
+    fn combined_verify_includes_campaign_gates() {
+        let yaml = r#"
+name: c
+verify_cmds: ["npm run test:all", "echo ok"]
+slices:
+  - name: s1
+    verify_cmds: ["echo ok"]
+"#;
+        let campaign: Campaign = serde_yaml::from_str(yaml).unwrap();
+        let gates = collect_combined_verify(&campaign);
+        assert_eq!(gates, vec!["echo ok".to_string(), "npm run test:all".to_string()]);
     }
 
     #[test]

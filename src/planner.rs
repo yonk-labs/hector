@@ -24,6 +24,26 @@ pub struct PlanOptions {
     pub max_iters: u32,
     pub judge_policy: String,
     pub auto_commit: bool,
+    /// Standing project constraints appended to every generated spec
+    /// (from hector.yaml `invariants:`). Empty = no block emitted.
+    pub invariants: Vec<String>,
+}
+
+/// Append the standing invariants block to a spec. None spec + invariants
+/// still yields a spec — the constraints must reach the builder either way.
+fn apply_invariants(spec: Option<String>, invariants: &[String]) -> Option<String> {
+    let rules: Vec<&String> = invariants.iter().filter(|s| !s.trim().is_empty()).collect();
+    if rules.is_empty() {
+        return spec;
+    }
+    let mut block = String::from("## Standing invariants (project-wide, non-negotiable)\n");
+    for r in rules {
+        block.push_str(&format!("- {}\n", r.trim()));
+    }
+    Some(match spec {
+        Some(s) => format!("{}\n\n{}", s.trim_end(), block),
+        None => block,
+    })
 }
 
 #[derive(Serialize)]
@@ -54,10 +74,11 @@ pub fn plan(opts: PlanOptions) -> anyhow::Result<String> {
     let campaign = Campaign {
         name: Some(name.clone()),
         auto_commit: opts.auto_commit,
+        verify_cmds: None,
         slices: vec![Slice {
             name: Some(name),
             task: Some(opts.task),
-            spec: opts.spec,
+            spec: apply_invariants(opts.spec, &opts.invariants),
             verify_cmds: Some(opts.verify_cmds),
             editable_paths: opts.editable_paths,
             reference_paths: opts.reference_paths,
@@ -71,6 +92,41 @@ pub fn plan(opts: PlanOptions) -> anyhow::Result<String> {
     let yaml = serde_yaml::to_string(&campaign)?;
     check_text(&yaml)?;
     Ok(yaml)
+}
+
+#[cfg(test)]
+mod invariant_tests {
+    use super::apply_invariants;
+
+    #[test]
+    fn appends_block_to_existing_spec() {
+        let out = apply_invariants(
+            Some("Do the thing.".into()),
+            &["no new deps".into(), "never weaken an assertion".into()],
+        )
+        .unwrap();
+        assert!(out.starts_with("Do the thing."));
+        assert!(out.contains("## Standing invariants"));
+        assert!(out.contains("- no new deps\n"));
+        assert!(out.contains("- never weaken an assertion\n"));
+    }
+
+    #[test]
+    fn creates_spec_when_none_but_invariants_exist() {
+        let out = apply_invariants(None, &["no new deps".into()]).unwrap();
+        assert!(out.starts_with("## Standing invariants"));
+    }
+
+    #[test]
+    fn no_invariants_leaves_spec_untouched() {
+        assert_eq!(
+            apply_invariants(Some("spec".into()), &[]).as_deref(),
+            Some("spec")
+        );
+        assert_eq!(apply_invariants(None, &[]), None);
+        // Whitespace-only entries don't produce an empty block.
+        assert_eq!(apply_invariants(None, &["  ".into()]), None);
+    }
 }
 
 /// The model's response when asked to write a test and plan a slice.
@@ -316,10 +372,11 @@ pub async fn plan_with_model(
     let campaign = Campaign {
         name: Some(name.clone()),
         auto_commit: opts.auto_commit,
+        verify_cmds: None,
         slices: vec![Slice {
             name: Some(name),
             task: Some(opts.task),
-            spec: Some(spec),
+            spec: apply_invariants(Some(spec), &opts.invariants),
             verify_cmds: Some(vec![resp.verify_cmd.clone()]),
             editable_paths: if resp.editable_paths.is_empty() {
                 opts.editable_paths.clone()
