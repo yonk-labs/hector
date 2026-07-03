@@ -113,6 +113,88 @@ fn error_result(name: &str, msg: String) -> SliceResult {
     }
 }
 
+/// Tier name → ordered member models, plus bob's default tier.
+struct BobTiers {
+    tiers: HashMap<String, Vec<String>>,
+    default_tier: Option<String>,
+}
+
+/// Tier→members map from `bob models --json` (bob ≥0.4.0), run in the
+/// campaign dir so repo-level tiers apply. None when bob is older, errors,
+/// or emits something unparseable — round-robin then simply doesn't happen.
+fn load_bob_tiers(bob_cmd: &str, dir: &Path) -> Option<BobTiers> {
+    let out = std::process::Command::new(bob_cmd)
+        .args(["models", "--json"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let tiers = v
+        .get("tiers")?
+        .as_object()?
+        .iter()
+        .map(|(name, members)| {
+            let m: Vec<String> = members
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (name.clone(), m)
+        })
+        .collect();
+    let default_tier = v
+        .get("default_tier")
+        .and_then(|d| d.as_str())
+        .map(String::from);
+    Some(BobTiers { tiers, default_tier })
+}
+
+/// Round-robin unpinned slices in a parallel batch across their tier's member
+/// models (notes #8/#17b): without this, every unpinned slice resolves to
+/// bob's stats-best model and one endpoint saturates while the others idle.
+/// Only kicks in when ≥2 unpinned slices share a tier with ≥2 members; a
+/// single slice keeps bob's adaptive stats-ranked pick.
+fn assign_round_robin(
+    slices: &[Option<Slice>],
+    batch: &[usize],
+    tiers: &HashMap<String, Vec<String>>,
+    default_tier: Option<&str>,
+) -> HashMap<usize, String> {
+    let tier_of = |i: usize| -> Option<&str> {
+        let s = slices[i].as_ref()?;
+        if s.model.is_some() {
+            return None; // explicit pin wins, excluded from spreading
+        }
+        let t = s.tier.as_deref().or(default_tier)?;
+        (tiers.get(t).map(|m| m.len()).unwrap_or(0) >= 2).then_some(t)
+    };
+    let mut per_tier: HashMap<&str, usize> = HashMap::new();
+    for &i in batch {
+        if let Some(t) = tier_of(i) {
+            *per_tier.entry(t).or_insert(0) += 1;
+        }
+    }
+    let mut counters: HashMap<&str, usize> = HashMap::new();
+    let mut out = HashMap::new();
+    for &i in batch {
+        let Some(t) = tier_of(i) else { continue };
+        if per_tier[t] < 2 {
+            continue;
+        }
+        let members = &tiers[t];
+        let c = counters.entry(t).or_insert(0);
+        out.insert(i, members[*c % members.len()].clone());
+        *c += 1;
+    }
+    out
+}
+
 /// Fixed escalation ladder mirroring bob's tiers. An unset tier (bob's
 /// configured default) escalates to medium as the first meaningful bump;
 /// frontier has nowhere to go.
@@ -128,14 +210,19 @@ fn next_tier(current: Option<&str>) -> Option<&'static str> {
 /// Run a slice; with `escalate`, retry ONCE at the next tier up when the first
 /// attempt doesn't converge. The escalation is loud (stderr + `escalated_to`
 /// in the report) — hector surfaces autonomy, it never hides it.
+///
+/// `rr_model` is a dispatch round-robin assignment (never a user pin): it
+/// applies to the first attempt only and is dropped on escalation, so the
+/// bumped tier picks its own (stronger) model.
 async fn run_slice_escalating(
     slice: Slice,
     bob_cmd: &str,
     campaign_dir: &Path,
     slice_name: &str,
     escalate: bool,
+    rr_model: Option<String>,
 ) -> SliceResult {
-    let sr = run_slice(&slice, bob_cmd, campaign_dir, slice_name)
+    let sr = run_slice(&slice, bob_cmd, campaign_dir, slice_name, rr_model.as_deref())
         .await
         .unwrap_or_else(|e| error_result(slice_name, e.to_string()));
     if sr.status == "converged" || !escalate {
@@ -151,7 +238,7 @@ async fn run_slice_escalating(
     );
     let mut retry_slice = slice;
     retry_slice.tier = Some(tier.to_string());
-    let mut retry = run_slice(&retry_slice, bob_cmd, campaign_dir, slice_name)
+    let mut retry = run_slice(&retry_slice, bob_cmd, campaign_dir, slice_name, None)
         .await
         .unwrap_or_else(|e| error_result(slice_name, e.to_string()));
     retry.escalated_to = Some(tier.to_string());
@@ -307,7 +394,35 @@ pub async fn run_campaign(
     let mut failed_names: HashSet<String> = HashSet::new();
     let mut any_applied = false;
 
+    // Tier→endpoint map for round-robin (bob ≥0.4.0; None degrades gracefully).
+    let bob_tiers = load_bob_tiers(bob_cmd, &apply_dir);
+
     for (batch_no, batch) in batches.iter().enumerate() {
+        let rr = match &bob_tiers {
+            Some(bt) => {
+                let rr =
+                    assign_round_robin(&slice_store, batch, &bt.tiers, bt.default_tier.as_deref());
+                if !rr.is_empty() {
+                    let mut named: Vec<String> = rr
+                        .iter()
+                        .map(|(i, m)| {
+                            let n = slice_store[*i]
+                                .as_ref()
+                                .and_then(|s| s.name.clone())
+                                .unwrap_or_else(|| format!("slice-{i}"));
+                            format!("{n}={m}")
+                        })
+                        .collect();
+                    named.sort();
+                    eprintln!(
+                        "hector dispatch: round-robin across tier endpoints — {}",
+                        named.join(", ")
+                    );
+                }
+                rr
+            }
+            None => HashMap::new(),
+        };
         let mut handles = Vec::new();
         for &idx in batch {
             let slice = slice_store[idx].take().expect("each slice dispatched once");
@@ -326,6 +441,7 @@ pub async fn run_campaign(
             let permit = semaphore.clone();
             let bob = bob_cmd.to_string();
             let campaign_dir = apply_dir.clone();
+            let rr_model = rr.get(&idx).cloned();
             handles.push(tokio::spawn(async move {
                 let _permit = permit.acquire().await.unwrap();
                 let slice_start = Instant::now();
@@ -341,7 +457,8 @@ pub async fn run_campaign(
                 }
                 eprintln!("hector dispatch: starting '{slice_name}'");
                 let mut sr =
-                    run_slice_escalating(slice, &bob, &campaign_dir, &slice_name, escalate).await;
+                    run_slice_escalating(slice, &bob, &campaign_dir, &slice_name, escalate, rr_model)
+                        .await;
                 sr.wall_secs = slice_start.elapsed().as_secs();
                 eprintln!(
                     "hector dispatch: '{slice_name}' done: {} in {}s",
@@ -641,12 +758,14 @@ fn run_gate(repo: &Path, cmd: &str) -> Result<(), String> {
     Err(format!("gate `{cmd}` failed: {tail}"))
 }
 
-/// Run a single slice through bob build.
+/// Run a single slice through bob build. `rr_model` is the dispatch
+/// round-robin assignment; the slice's own `model` pin wins over it.
 async fn run_slice(
     slice: &Slice,
     bob_cmd: &str,
     campaign_dir: &Path,
     slice_name: &str,
+    rr_model: Option<&str>,
 ) -> anyhow::Result<SliceResult> {
     let task = slice.task.as_deref().unwrap_or("(no task)");
 
@@ -699,6 +818,12 @@ async fn run_slice(
     }
     if let Some(t) = &slice.tier {
         cmd.arg("--tier").arg(t);
+    }
+    if let Some(m) = slice.model.as_deref().or(rr_model) {
+        cmd.arg("--model").arg(m);
+    }
+    for f in &slice.fallback_models {
+        cmd.arg("--fallback-model").arg(f);
     }
 
     // Propose mode (no --apply): builds run in parallel in isolated worktrees;
@@ -978,6 +1103,49 @@ slices:
         assert!(!slice_already_green(&d, &red));
         // No gates → never "landed" (nothing was proven).
         assert!(!slice_already_green(&d, &Slice::default()));
+    }
+
+    #[test]
+    fn round_robin_spreads_unpinned_same_tier_slices() {
+        let tiers: HashMap<String, Vec<String>> = [(
+            "medium".to_string(),
+            vec!["qwen-193".to_string(), "gemma-133".to_string()],
+        )]
+        .into();
+        let slice = |tier: Option<&str>, model: Option<&str>| {
+            Some(Slice {
+                tier: tier.map(String::from),
+                model: model.map(String::from),
+                ..Default::default()
+            })
+        };
+
+        // Three unpinned slices on the default tier alternate across members.
+        let slices = vec![slice(None, None), slice(None, None), slice(None, None)];
+        let rr = assign_round_robin(&slices, &[0, 1, 2], &tiers, Some("medium"));
+        assert_eq!(rr[&0], "qwen-193");
+        assert_eq!(rr[&1], "gemma-133");
+        assert_eq!(rr[&2], "qwen-193");
+
+        // A pinned slice is excluded; the two unpinned ones still spread.
+        let slices = vec![slice(None, Some("glm")), slice(None, None), slice(None, None)];
+        let rr = assign_round_robin(&slices, &[0, 1, 2], &tiers, Some("medium"));
+        assert!(!rr.contains_key(&0), "explicit pin wins");
+        assert_eq!(rr.len(), 2);
+
+        // A single unpinned slice keeps bob's stats-ranked pick.
+        let slices = vec![slice(None, None)];
+        assert!(assign_round_robin(&slices, &[0], &tiers, Some("medium")).is_empty());
+
+        // No default tier and no slice tier → nothing to spread across.
+        let slices = vec![slice(None, None), slice(None, None)];
+        assert!(assign_round_robin(&slices, &[0, 1], &tiers, None).is_empty());
+
+        // Unknown tier or single-member tier → no assignment.
+        let one: HashMap<String, Vec<String>> =
+            [("solo".to_string(), vec!["only".to_string()])].into();
+        let slices = vec![slice(Some("solo"), None), slice(Some("solo"), None)];
+        assert!(assign_round_robin(&slices, &[0, 1], &one, None).is_empty());
     }
 
     fn report(failed: usize, integration: Option<IntegrationReport>) -> DispatchReport {

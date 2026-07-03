@@ -87,6 +87,8 @@ pub fn plan(opts: PlanOptions) -> anyhow::Result<String> {
             max_changed_files: Some(opts.max_changed_files),
             max_changed_lines: Some(opts.max_changed_lines),
             tier: None,
+            model: None,
+            fallback_models: Vec::new(),
             depends_on: Vec::new(),
         }],
     };
@@ -634,6 +636,8 @@ pub async fn plan_with_model(
             max_changed_files: Some(opts.max_changed_files),
             max_changed_lines: Some(opts.max_changed_lines),
             tier: None,
+            model: None,
+            fallback_models: Vec::new(),
             depends_on: Vec::new(),
         }],
     };

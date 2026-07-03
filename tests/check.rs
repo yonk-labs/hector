@@ -585,17 +585,28 @@ fn plan_with_symbol_degrades_gracefully_when_maple_missing() {
 // when a --tier flag is present (proving --escalate retries at a higher tier);
 // task "fail" never converges.
 const FAKE_BOB: &str = r#"#!/bin/sh
+if [ "$1" = "models" ]; then
+  printf '{"default_model":"m1","default_tier":"medium","models":{},"tiers":{"medium":["m1","m2"]}}'
+  exit 0
+fi
 task="$3"
+model=""
+prev=""
+for arg in "$@"; do
+  [ "$prev" = "--model" ] && model="$arg"
+  prev="$arg"
+done
 case "$*" in *--tier*) tiered=1;; *) tiered=0;; esac
 emit_ok() {
   f="$1"
-  printf '{"status":"converged","changed_files":["%s"],"final_diff":"diff --git a/%s b/%s\\nnew file mode 100644\\n--- /dev/null\\n+++ b/%s\\n@@ -0,0 +1 @@\\n+hello\\n"}' "$f" "$f" "$f" "$f"
+  printf '{"status":"converged","changed_files":["%s"],"builder":{"model":"%s"},"final_diff":"diff --git a/%s b/%s\\nnew file mode 100644\\n--- /dev/null\\n+++ b/%s\\n@@ -0,0 +1 @@\\n+hello\\n"}' "$f" "$model" "$f" "$f" "$f"
 }
 emit_fail() { printf '{"status":"not_converged","stop_reason":"JudgeRejected","final_diff":""}'; }
 case "$task" in
   a) emit_ok a.txt ;;
   b) if [ -f a.txt ]; then emit_ok b.txt; else emit_fail; fi ;;
   c) if [ "$tiered" = 1 ]; then emit_ok c.txt; else emit_fail; fi ;;
+  d) emit_ok d.txt ;;
   *) emit_fail ;;
 esac
 "#;
@@ -745,6 +756,39 @@ slices:
     assert!(stdout.contains("\"converged\": 1"), "{stdout}");
     assert!(stdout.contains("\"escalated_to\": \"medium\""), "{stdout}");
     assert!(dir.join("c.txt").exists());
+}
+
+#[test]
+fn dispatch_round_robins_unpinned_parallel_slices_across_tier_members() {
+    let dir = tmp_dir("hector-dispatch-rr");
+    // Two unpinned slices in one flat batch; fake bob's `models --json`
+    // advertises tier medium = [m1, m2] as the default tier. Dispatch must
+    // spread them instead of letting both resolve to bob's stats-best model.
+    let bob = init_dispatch_repo(
+        &dir,
+        r#"
+name: rr
+slices:
+  - name: first
+    task: a
+    verify_cmds: ["test -f a.txt"]
+    editable_paths: ["a.txt"]
+  - name: second
+    task: d
+    verify_cmds: ["test -f d.txt"]
+    editable_paths: ["d.txt"]
+"#,
+    );
+    let out = hector_in(
+        &dir,
+        &["dispatch", "--file", "campaign.yaml", "--bob-cmd", bob.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"model\": \"m1\""), "{stdout}");
+    assert!(stdout.contains("\"model\": \"m2\""), "{stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("round-robin"), "announced on stderr: {stderr}");
 }
 
 #[test]

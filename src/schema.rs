@@ -51,6 +51,15 @@ pub struct Slice {
     /// `hector dispatch` (passes `--tier`) and `bob campaign`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// Explicit builder model pin (a name from bob's builder.models or a raw
+    /// provider/model id). Matches bob's campaign::Slice. A pinned slice is
+    /// excluded from dispatch's endpoint round-robin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Fallback model chain, tried in order if the builder errors or stalls.
+    /// Matches bob's campaign::Slice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_models: Vec<String>,
     /// Slice names this slice depends on. Consumed only by `hector dispatch`,
     /// which runs dependency-ordered batches and commits between them so later
     /// batches build on earlier results; `bob campaign` (sequential anyway)
@@ -133,10 +142,14 @@ slices:
     max_changed_files: 5
     max_changed_lines: 50
     tier: medium
+    model: qwen-193
+    fallback_models: [gemma-133]
 "#;
         let c: Campaign = serde_yaml::from_str(yaml).unwrap();
         assert!(c.auto_commit);
         let s = &c.slices[0];
+        assert_eq!(s.model.as_deref(), Some("qwen-193"));
+        assert_eq!(s.fallback_models, vec!["gemma-133"]);
         assert_eq!(s.task.as_deref(), Some("do x"));
         assert_eq!(s.spec.as_deref(), Some("the spec"));
         assert_eq!(s.verify_cmds.as_deref(), Some(&["cargo test x".to_string()][..]));
