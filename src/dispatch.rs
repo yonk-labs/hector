@@ -10,9 +10,9 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Serialize)]
 pub struct DispatchReport {
@@ -214,6 +214,12 @@ fn next_tier(current: Option<&str>) -> Option<&'static str> {
 /// `rr_model` is a dispatch round-robin assignment (never a user pin): it
 /// applies to the first attempt only and is dropped on escalation, so the
 /// bumped tier picks its own (stronger) model.
+///
+/// `permit` is the build slot for the first attempt; run_slice releases it at
+/// that attempt's verify_start (pipelining, #17a). On escalation we re-acquire
+/// a fresh slot from `sem` for the retry, so the second builder still waits its
+/// turn instead of oversubscribing the endpoints.
+#[allow(clippy::too_many_arguments)]
 async fn run_slice_escalating(
     slice: Slice,
     bob_cmd: &str,
@@ -221,10 +227,21 @@ async fn run_slice_escalating(
     slice_name: &str,
     escalate: bool,
     rr_model: Option<String>,
+    sem: Arc<Semaphore>,
+    run_id_base: String,
+    permit: OwnedSemaphorePermit,
 ) -> SliceResult {
-    let sr = run_slice(&slice, bob_cmd, campaign_dir, slice_name, rr_model.as_deref())
-        .await
-        .unwrap_or_else(|e| error_result(slice_name, e.to_string()));
+    let sr = run_slice(
+        &slice,
+        bob_cmd,
+        campaign_dir,
+        slice_name,
+        rr_model.as_deref(),
+        &run_id_base,
+        permit,
+    )
+    .await
+    .unwrap_or_else(|e| error_result(slice_name, e.to_string()));
     if sr.status == "converged" || !escalate {
         return sr;
     }
@@ -238,9 +255,21 @@ async fn run_slice_escalating(
     );
     let mut retry_slice = slice;
     retry_slice.tier = Some(tier.to_string());
-    let mut retry = run_slice(&retry_slice, bob_cmd, campaign_dir, slice_name, None)
-        .await
-        .unwrap_or_else(|e| error_result(slice_name, e.to_string()));
+    // Wait for a build slot again — the first attempt's permit was freed at its
+    // verify_start (or process exit).
+    let retry_permit = sem.acquire_owned().await.expect("semaphore open");
+    let retry_run_id = format!("{run_id_base}-esc");
+    let mut retry = run_slice(
+        &retry_slice,
+        bob_cmd,
+        campaign_dir,
+        slice_name,
+        None,
+        &retry_run_id,
+        retry_permit,
+    )
+    .await
+    .unwrap_or_else(|e| error_result(slice_name, e.to_string()));
     retry.escalated_to = Some(tier.to_string());
     retry
 }
@@ -388,6 +417,16 @@ pub async fn run_campaign(
         .ok();
 
     let semaphore = Arc::new(Semaphore::new(max_jobs));
+    // Per-dispatch nonce for bob --run-id values: pid + epoch secs keeps run
+    // dirs fresh across re-dispatches (bob rejects a colliding run dir).
+    let run_nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
     let start = Instant::now();
     let mut slice_store: Vec<Option<Slice>> = campaign.slices.into_iter().map(Some).collect();
     let mut slices: Vec<SliceResult> = Vec::new();
@@ -438,12 +477,16 @@ pub async fn run_campaign(
                 continue;
             }
 
-            let permit = semaphore.clone();
+            let sem = semaphore.clone();
             let bob = bob_cmd.to_string();
             let campaign_dir = apply_dir.clone();
             let rr_model = rr.get(&idx).cloned();
+            let run_id_base = format!("hector-{run_nonce}-{idx}");
             handles.push(tokio::spawn(async move {
-                let _permit = permit.acquire().await.unwrap();
+                // The permit bounds the cheap green-check too (its verify gates
+                // can be a full suite), then hands off to run_slice, which frees
+                // it early at verify_start so the next slice starts building.
+                let permit = sem.clone().acquire_owned().await.unwrap();
                 let slice_start = Instant::now();
                 if slice_already_green(&campaign_dir, &slice) {
                     eprintln!(
@@ -456,9 +499,18 @@ pub async fn run_campaign(
                     return sr;
                 }
                 eprintln!("hector dispatch: starting '{slice_name}'");
-                let mut sr =
-                    run_slice_escalating(slice, &bob, &campaign_dir, &slice_name, escalate, rr_model)
-                        .await;
+                let mut sr = run_slice_escalating(
+                    slice,
+                    &bob,
+                    &campaign_dir,
+                    &slice_name,
+                    escalate,
+                    rr_model,
+                    sem,
+                    run_id_base,
+                    permit,
+                )
+                .await;
                 sr.wall_secs = slice_start.elapsed().as_secs();
                 eprintln!(
                     "hector dispatch: '{slice_name}' done: {} in {}s",
@@ -758,21 +810,64 @@ fn run_gate(repo: &Path, cmd: &str) -> Result<(), String> {
     Err(format!("gate `{cmd}` failed: {tail}"))
 }
 
+/// Poll bob's events log until a `verify_start` event appears (bob has left the
+/// builder and entered verify). Always spawned then `abort`ed within the slice's
+/// process lifetime, so the infinite loop can't leak.
+/// ponytail: 200ms poll + whole-file reparse — events.jsonl is a handful of
+/// lines; switch to tailing offsets only if it ever grows large.
+async fn wait_for_verify_start(path: &Path) {
+    loop {
+        // ponytail: blocking read of a <2KB file inside the async task — cheaper
+        // than pulling in tokio's `fs` feature for a sub-ms syscall.
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if text.lines().any(is_verify_start) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// True when a JSONL line is bob's `{"event":"verify_start",...}`.
+fn is_verify_start(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.get("event")
+                .and_then(|e| e.as_str())
+                .map(|e| e == "verify_start")
+        })
+        .unwrap_or(false)
+}
+
 /// Run a single slice through bob build. `rr_model` is the dispatch
 /// round-robin assignment; the slice's own `model` pin wins over it.
+///
+/// `run_id` names bob's run so its events log path is known before spawn; a
+/// sidecar watches it and releases `permit` the moment bob enters verify, so
+/// the next queued slice starts building while this one runs its (endpoint-idle)
+/// verify gates — dispatch pipelining, #17a.
 async fn run_slice(
     slice: &Slice,
     bob_cmd: &str,
     campaign_dir: &Path,
     slice_name: &str,
     rr_model: Option<&str>,
+    run_id: &str,
+    permit: OwnedSemaphorePermit,
 ) -> anyhow::Result<SliceResult> {
     let task = slice.task.as_deref().unwrap_or("(no task)");
 
     let mut cmd = Command::new(bob_cmd);
     // --json: bob emits only the RunResult JSON (diff in final_diff). Without it
     // bob prints a human summary + raw diff, which isn't parseable.
-    cmd.arg("build").arg("--json").arg(task).current_dir(campaign_dir);
+    // --run-id: fixes bob's events log path (see the sidecar below).
+    cmd.arg("build")
+        .arg("--json")
+        .arg("--run-id")
+        .arg(run_id)
+        .arg(task)
+        .current_dir(campaign_dir);
 
     // All verify gates — bob's --verify is repeatable. (Previously only the
     // first gate was passed, silently dropping the rest.)
@@ -834,7 +929,25 @@ async fn run_slice(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
-    let output = cmd.output().await?;
+    // Pipelining sidecar: hand the permit to a shared cell, then watch bob's
+    // events.jsonl. On verify_start the cell is emptied → permit dropped → the
+    // next slice's builder starts while this one verifies. Path assumes bob's
+    // default artifacts.dir (.bob/runs); a custom dir just never matches, and we
+    // fall back to releasing at process exit (today's behavior).
+    let permit_cell = Arc::new(std::sync::Mutex::new(Some(permit)));
+    let events_path = campaign_dir.join(".bob/runs").join(run_id).join("events.jsonl");
+    let watcher_cell = permit_cell.clone();
+    let watcher = tokio::spawn(async move {
+        wait_for_verify_start(&events_path).await;
+        watcher_cell.lock().unwrap().take();
+    });
+
+    let output = cmd.output().await;
+    // Process is fully done: stop the watcher and release the slot if verify_start
+    // never showed (fast error, custom artifacts.dir, older bob).
+    watcher.abort();
+    permit_cell.lock().unwrap().take();
+    let output = output?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1103,6 +1216,19 @@ slices:
         assert!(!slice_already_green(&d, &red));
         // No gates → never "landed" (nothing was proven).
         assert!(!slice_already_green(&d, &Slice::default()));
+    }
+
+    #[test]
+    fn verify_start_line_detected() {
+        // bob's real shape (engine.rs:1199) — extra fields present.
+        assert!(is_verify_start(
+            r#"{"event":"verify_start","iter":0,"focused":true,"ts":1783088904}"#
+        ));
+        // Other events and garbage must not trip it.
+        assert!(!is_verify_start(r#"{"event":"builder_done","iter":0}"#));
+        assert!(!is_verify_start(r#"{"event":"run_start","model":"x"}"#));
+        assert!(!is_verify_start("not json"));
+        assert!(!is_verify_start(""));
     }
 
     #[test]

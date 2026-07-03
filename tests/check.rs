@@ -589,7 +589,8 @@ if [ "$1" = "models" ]; then
   printf '{"default_model":"m1","default_tier":"medium","models":{},"tiers":{"medium":["m1","m2"]}}'
   exit 0
 fi
-task="$3"
+# hector calls: build --json --run-id <id> <task> [flags...] → task is $5.
+task="$5"
 model=""
 prev=""
 for arg in "$@"; do
