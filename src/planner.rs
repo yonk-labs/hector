@@ -261,9 +261,28 @@ fn tail_str(s: &str, max: usize) -> String {
 /// Pull the identifier a "missing symbol" error names, e.g. "warWearinessPenalty"
 /// out of `TypeError: warWearinessPenalty is not a function` or the Babel/CJS
 /// interop form `(0 , _core_moraleUtils.warWearinessPenalty) is not a function`.
-/// Returns None when the text before the marker isn't a plain identifier (e.g.
-/// `Class extends value #<Object> is not a constructor` — nothing nameable there).
+/// Also extracts the module path from `Cannot find module 'X'` (#24: brand-new
+/// modules under test). Returns None when the text before the marker isn't a
+/// plain identifier (e.g. `Class extends value #<Object> is not a constructor`
+/// — nothing nameable there).
 fn extract_missing_symbol(output: &str) -> Option<String> {
+    // "Cannot find module 'packages/worldgen/src/bandits'" — the quoted path
+    // is what's missing. Returned as-is (caller checks against editable_paths).
+    const MODULE_MARKERS: &[&str] = &["Cannot find module", "Cannot find module"];
+    for marker in MODULE_MARKERS {
+        if let Some(idx) = output.find(marker) {
+            let after = output[idx + marker.len()..].trim_start();
+            // Strip surrounding quotes: '...' or "..."
+            let stripped = after.trim_start_matches(['\'', '"']);
+            let path: String = stripped
+                .chars()
+                .take_while(|c| *c != '\'' && *c != '"')
+                .collect();
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
+    }
     const SUFFIX_MARKERS: &[&str] = &[" is not a function", " is not a constructor", " is not defined"];
     for marker in SUFFIX_MARKERS {
         if let Some(idx) = output.find(marker) {
@@ -311,7 +330,11 @@ fn extract_missing_symbol(output: &str) -> Option<String> {
 /// doesn't exist yet, that's the correct red state, not a broken test. The same
 /// error naming some OTHER symbol (a broken import, a typo'd helper) is still
 /// infrastructure: the test itself can't load.
-fn is_infrastructure_error(output: &str, base_prompt: &str) -> bool {
+///
+/// `editable_paths` are the production files bob will create. A "Cannot find
+/// module" error naming one of those is a brand-new module under test (#24) —
+/// the module doesn't exist yet by design, not a broken import.
+fn is_infrastructure_error(output: &str, base_prompt: &str, editable_paths: &[String]) -> bool {
     let lower = output.to_lowercase();
     const PATTERNS: &[&str] = &[
         "cannot find module",
@@ -330,18 +353,109 @@ fn is_infrastructure_error(output: &str, base_prompt: &str) -> bool {
         "has no exported member",
     ];
     // But NOT when it's clearly an assertion failure that happens to contain a keyword
-    if lower.contains("expect(received)") || lower.contains("assertion") {
+    if lower.contains("expected:") && lower.contains("received:")
+        || lower.contains("assertionerror")
+        || lower.contains("number of assertions")
+    {
         return false;
     }
     if !PATTERNS.iter().any(|p| lower.contains(p)) {
         return false;
     }
     if let Some(symbol) = extract_missing_symbol(output) {
-        if base_prompt.contains(&symbol) {
-            return false;
+        // #24: "Cannot find module 'packages/worldgen/src/bandits'" — the
+        // extracted value is a path. If it matches an editable_path (the file
+        // bob will create), this is a brand-new module under test, not a typo.
+        if lower.contains("cannot find module") || lower.contains("module not found") {
+            // #24: only editable_paths can prove this is a brand-new module
+            // under test. Prompt matching is too loose — reference paths
+            // (read-only files) would false-positive.
+            if is_editable_module(&symbol, editable_paths) {
+                return false;
+            }
+        } else {
+            // Symbol-name patterns (is not a function / has no exported member):
+            // check against the prompt as before.
+            if base_prompt.contains(&symbol) {
+                return false;
+            }
         }
     }
     true
+}
+
+/// Check whether a module path from a "Cannot find module" error matches one
+/// of the editable_paths — the files bob will create. Handles relative paths
+/// (../packages/worldgen/src/bandits → packages/worldgen/src/bandits) and
+/// missing extensions (bandits → bandits.ts).
+fn is_editable_module(module_path: &str, editable_paths: &[String]) -> bool {
+    // Normalize: strip leading ./ and ../ segments, take the tail path.
+    let normalized: String = module_path
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .collect::<Vec<_>>()
+        .join("/");
+    let normalized_basename = Path::new(&normalized)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&normalized);
+    for editable in editable_paths {
+        let edit_normalized: String = editable
+            .split('/')
+            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+            .collect::<Vec<_>>()
+            .join("/");
+        // Direct match (with or without extension).
+        if edit_normalized == normalized
+            || edit_normalized == format!("{normalized}.ts")
+            || edit_normalized == format!("{normalized}.js")
+            || edit_normalized == format!("{normalized}.tsx")
+            || edit_normalized == format!("{normalized}.jsx")
+        {
+            return true;
+        }
+        // Basename match (the test imported a different relative path but the
+        // target file is the same editable_path).
+        let edit_basename = Path::new(&edit_normalized)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&edit_normalized);
+        if edit_basename == normalized_basename && !normalized_basename.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+/// #12 backstop: after the classifier says "not infra" (legitimate red), check
+/// that the output actually looks like a test failure — not pure runtime error
+/// noise that slipped through a classifier gap. A real TDD red has assertion
+/// vocabulary or a missing-symbol-under-test marker. Pure error output with
+/// none of these is suspicious — better to retry than accept a broken test.
+/// ponytail: keyword scan, not a parser; add patterns as false-negatives surface.
+fn looks_like_test_failure(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "expected:",       // vitest/jest assertion output
+        "received:",       // vitest/jest assertion output
+        "assertionerror",  // JS AssertionError class
+        "tests:",          // test runner summary ("Tests: 1 failed, 3 passed")
+        "test suites:",    // jest summary
+        "fail",            // "FAIL" / "failed" / "failing"
+        "✓",               // vitest pass marker (at least some tests ran)
+        "✗",               // vitest fail marker
+        "passed",          // "3 passed"
+        "expect(",         // vitest/jest expect() call in output
+        "tobe(",           // common matcher in output
+        "toequal(",        // common matcher in output
+        "is not a function", // missing-symbol-under-test (TDD red for new function)
+        "is not defined",    // missing-symbol-under-test
+        "is not a constructor", // missing-symbol-under-test
+        "has no exported member", // TS missing export (TDD red for new export)
+        "cannot find module", // new-module-under-test (TDD red for new module)
+        "error:",           // generic error that still indicates a test ran
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 #[cfg(test)]
@@ -352,31 +466,31 @@ mod infra_tests {
     fn detects_import_error() {
         let out = "TypeError: Class extends value #<Object> is not a constructor or null\n\
                    at Object.<anonymous> (tests/player.test.js:1:18)";
-        assert!(is_infrastructure_error(out, ""));
+        assert!(is_infrastructure_error(out, "", &[]));
     }
 
     #[test]
     fn detects_module_not_found() {
         let out = "Error: Cannot find module '../src/body'\nRequire stack:";
-        assert!(is_infrastructure_error(out, ""));
+        assert!(is_infrastructure_error(out, "", &[]));
     }
 
     #[test]
     fn detects_syntax_error() {
         let out = "SyntaxError: Unexpected token }";
-        assert!(is_infrastructure_error(out, ""));
+        assert!(is_infrastructure_error(out, "", &[]));
     }
 
     #[test]
     fn does_not_flag_assertion_failure() {
         let out = "expect(received).toBe(expected)\nExpected: 28\nReceived: 27";
-        assert!(!is_infrastructure_error(out, ""));
+        assert!(!is_infrastructure_error(out, "", &[]));
     }
 
     #[test]
     fn does_not_flag_test_failure_summary() {
         let out = "FAIL tests/body.test.js\nTests: 1 failed, 7 passed";
-        assert!(!is_infrastructure_error(out, ""));
+        assert!(!is_infrastructure_error(out, "", &[]));
     }
 
     // --- new-symbol-under-test vs. broken-import disambiguation ---
@@ -390,7 +504,7 @@ mod infra_tests {
                             ## SPEC\nwarWearinessPenalty(0) must return 0.";
         let out = "TypeError: warWearinessPenalty is not a function\n\
                    at Object.<anonymous> (core/moraleUtils.test.ts:5:18)";
-        assert!(!is_infrastructure_error(out, base_prompt));
+        assert!(!is_infrastructure_error(out, base_prompt, &[]));
     }
 
     #[test]
@@ -399,7 +513,7 @@ mod infra_tests {
         let base_prompt = "## TASK\nAdd warWearinessPenalty to core/moraleUtils.\n\n\
                             ## SPEC\nwarWearinessPenalty(3) must return 6.";
         let out = "TypeError: (0 , _core_moraleUtils.warWearinessPenalty) is not a function";
-        assert!(!is_infrastructure_error(out, base_prompt));
+        assert!(!is_infrastructure_error(out, base_prompt, &[]));
     }
 
     // #19: a truncated / reasoning-only model response must classify as EOF so
@@ -430,7 +544,7 @@ mod infra_tests {
                             ## SPEC\nwarWearinessPenalty(0) must return 0.";
         let out = "TypeError: someOtherHelper is not a function\n\
                    at Object.<anonymous> (core/moraleUtils.test.ts:5:18)";
-        assert!(is_infrastructure_error(out, base_prompt));
+        assert!(is_infrastructure_error(out, base_prompt, &[]));
     }
 
     #[test]
@@ -440,28 +554,118 @@ mod infra_tests {
         // prompt (e.g. it's a legitimate reference path the test typo'd).
         let base_prompt = "## REFERENCE FILES\ncore/body.ts";
         let out = "Error: Cannot find module '../core/body'\nRequire stack:";
-        assert!(is_infrastructure_error(out, base_prompt));
+        assert!(is_infrastructure_error(out, base_prompt, &[]));
     }
 
     #[test]
     fn new_symbol_is_not_defined_is_not_infra() {
         let base_prompt = "## SPEC\nCall warWearinessPenalty(turns) directly (no import).";
         let out = "ReferenceError: warWearinessPenalty is not defined";
-        assert!(!is_infrastructure_error(out, base_prompt));
+        assert!(!is_infrastructure_error(out, base_prompt, &[]));
     }
 
     #[test]
     fn new_symbol_has_no_exported_member_is_not_infra() {
         let base_prompt = "## SPEC\nExport warWearinessPenalty from core/moraleUtils.";
         let out = "TS2305: Module '\"../core/moraleUtils\"' has no exported member 'warWearinessPenalty'.";
-        assert!(!is_infrastructure_error(out, base_prompt));
+        assert!(!is_infrastructure_error(out, base_prompt, &[]));
     }
 
     #[test]
     fn unrelated_has_no_exported_member_is_still_infra() {
         let base_prompt = "## SPEC\nwarWearinessPenalty(0) must return 0.";
         let out = "TS2305: Module '\"../core/moraleUtils\"' has no exported member 'someOtherHelper'.";
-        assert!(is_infrastructure_error(out, base_prompt));
+        assert!(is_infrastructure_error(out, base_prompt, &[]));
+    }
+
+    // --- #24: brand-new module under test (Cannot find module) ---
+
+    #[test]
+    fn new_module_under_test_is_legitimate_red_when_in_editable_paths() {
+        // The test imports packages/worldgen/src/bandits which doesn't exist
+        // yet — bob will create it. This is TDD red, not a broken import.
+        let out = "Error: Cannot find module '../packages/worldgen/src/bandits'\nRequire stack:";
+        let editable = vec!["packages/worldgen/src/bandits.ts".to_string()];
+        assert!(!is_infrastructure_error(out, "", &editable));
+    }
+
+    #[test]
+    fn new_module_under_test_basename_match_in_editable_paths() {
+        // Test imports via a different relative path but the target file
+        // basename matches an editable_path.
+        let out = "Error: Cannot find module '../../bandits'\nRequire stack:";
+        let editable = vec!["packages/worldgen/src/bandits.ts".to_string()];
+        assert!(!is_infrastructure_error(out, "", &editable));
+    }
+
+    #[test]
+    fn new_module_under_test_prompt_mentions_basename() {
+        // Module path matches an editable_path even though the import path in
+        // the error differs in relative depth — it's being created, not a typo.
+        let base_prompt = "## TASK\nCreate packages/worldgen/src/bandits.ts implementing the bandit AI.";
+        let out = "Error: Cannot find module '../packages/worldgen/src/bandits'\nRequire stack:";
+        let editable = vec!["packages/worldgen/src/bandits.ts".to_string()];
+        assert!(!is_infrastructure_error(out, base_prompt, &editable));
+    }
+
+    #[test]
+    fn broken_import_unrelated_to_editable_paths_still_infra() {
+        // The missing module has nothing to do with the editable_paths —
+        // it's a real typo or wrong path in the test.
+        let out = "Error: Cannot find module './testHelpers'\nRequire stack:";
+        let editable = vec!["packages/worldgen/src/bandits.ts".to_string()];
+        assert!(is_infrastructure_error(out, "", &editable));
+    }
+
+    #[test]
+    fn broken_import_still_infra_with_empty_editable_paths() {
+        // No editable_paths provided — Cannot find module stays infra
+        // (can't prove it's a new module under test).
+        let base_prompt = "## REFERENCE FILES\ncore/body.ts";
+        let out = "Error: Cannot find module '../core/body'\nRequire stack:";
+        assert!(is_infrastructure_error(out, base_prompt, &[]));
+    }
+
+    // --- #12: tightened escape hatch (no more bare "assertion" false-negative) ---
+
+    #[test]
+    fn infra_error_with_word_assertion_in_stack_trace_still_infra() {
+        // The bare word "assertion" in a stack trace or plugin name used to
+        // bypass classification entirely. Tightened: need "expected:/received:"
+        // pair or "assertionerror" — not just "assertion".
+        let out = "Cannot find module './testHelpers'\n    at runAssertion (node:internal)";
+        assert!(is_infrastructure_error(out, "", &[]));
+    }
+
+    #[test]
+    fn real_assertion_failure_still_not_infra() {
+        // Genuine vitest assertion output still correctly bypasses infra.
+        let out = "AssertionError: expected 28 to be 27\nExpected: 28\nReceived: 27";
+        assert!(!is_infrastructure_error(out, "", &[]));
+    }
+
+    // --- #12 backstop: looks_like_test_failure ---
+
+    #[test]
+    fn looks_like_test_failure_recognizes_assertion_output() {
+        assert!(super::looks_like_test_failure(
+            "Expected: 28\nReceived: 27"
+        ));
+        assert!(super::looks_like_test_failure(
+            "Tests: 1 failed, 3 passed"
+        ));
+        assert!(super::looks_like_test_failure(
+            "FAIL core/bandits.test.ts"
+        ));
+    }
+
+    #[test]
+    fn looks_like_test_failure_rejects_pure_error_noise() {
+        // No test-failure vocabulary at all — likely a runtime crash the
+        // classifier missed. Should NOT pass the backstop.
+        assert!(!super::looks_like_test_failure(
+            "thread 'main' panicked at 'index out of bounds'"
+        ));
     }
 
     #[test]
@@ -499,9 +703,10 @@ async fn write_test_with(
     cfg: &ModelCfg,
     base_prompt: &str,
     repo_root: &Path,
+    editable_paths: &[String],
 ) -> anyhow::Result<ModelPlanResponse> {
     let mut written: Vec<std::path::PathBuf> = Vec::new();
-    let result = write_test_attempts(cfg, base_prompt, repo_root, &mut written).await;
+    let result = write_test_attempts(cfg, base_prompt, repo_root, &mut written, editable_paths).await;
     if result.is_err() {
         for p in &written {
             let _ = std::fs::remove_file(p);
@@ -515,6 +720,7 @@ async fn write_test_attempts(
     base_prompt: &str,
     repo_root: &Path,
     written: &mut Vec<std::path::PathBuf>,
+    editable_paths: &[String],
 ) -> anyhow::Result<ModelPlanResponse> {
     // Hard caps to prevent infinite loop of doom:
     //   max_retries  = infra-error retries (model wrote a test that can't load)
@@ -621,7 +827,7 @@ async fn write_test_attempts(
         }
 
         // Test failed (red). But WHY? Infrastructure error vs assertion failure.
-        if is_infrastructure_error(&output_text, base_prompt) {
+        if is_infrastructure_error(&output_text, base_prompt, editable_paths) {
             if infra_attempt < max_retries {
                 infra_attempt += 1;
                 eprintln!(
@@ -646,6 +852,30 @@ async fn write_test_attempts(
                 "test still has infrastructure errors after {max_retries} retries: {}",
                 tail_str(&output_text, 300)
             );
+        }
+        // #12 backstop: the classifier said "not infra" (legitimate red), but
+        // verify the output actually looks like a test failure. A real TDD red
+        // has assertion vocabulary (expected/received/fail/tests:) or a
+        // missing-symbol-under-test marker. If the output is pure error noise
+        // with NO test-failure vocabulary at all, the classifier was wrong —
+        // treat as infra and retry/bail instead of accepting a broken test.
+        if !looks_like_test_failure(&output_text) && infra_attempt < max_retries {
+            infra_attempt += 1;
+            eprintln!(
+                "hector: warning — test failed but output has no test-failure vocabulary \
+                 (possible classifier miss), retrying ({infra_attempt}/{max_retries})..."
+            );
+            current_prompt = format!(
+                "{initial}\n\n\
+                 ## PREVIOUS TEST FAILED IN AN UNEXPECTED WAY\n\
+                 The test you wrote failed, but not with a normal assertion failure. Output:\n{err}\n\n\
+                 Common fixes:\n\
+                 - Check that imports resolve and the test file can load\n\
+                 - Check that the test actually runs assertions (not just imports)\n",
+                initial = base_prompt,
+                err = tail_str(&output_text, 800)
+            );
+            continue;
         }
         eprintln!("hector: test fails as expected (red) ✓");
         return Ok(resp);
@@ -729,6 +959,11 @@ pub async fn plan_with_model(
         )
     };
 
+    // #13: conventions are path-aware. A repo-wide scan picks the first test
+    // file alphabetically (core/ before packages/), but this slice's module
+    // may live in a different subtree. Adjust conventions to the editable_paths.
+    let conventions = conventions.for_editable_paths(&opts.editable_paths, repo_root);
+
     let user_prompt = format!(
         "## TASK\n{task}\n\n\
          ## SPEC (authoritative — write a test that exercises this exact behavior)\n{spec}\n\n\
@@ -747,7 +982,7 @@ pub async fn plan_with_model(
             "hector: asking model '{}' to write a focused test against the spec...",
             cfg.name
         );
-        match write_test_with(cfg, &user_prompt, repo_root).await {
+        match write_test_with(cfg, &user_prompt, repo_root, &opts.editable_paths).await {
             Ok(r) => {
                 resp = Some(r);
                 break;

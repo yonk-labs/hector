@@ -160,6 +160,68 @@ fn find_test_file(root: &Path, dir: &Path, depth: u32) -> Option<String> {
 }
 
 impl Conventions {
+    /// Adjust conventions for a specific slice's editable_paths. A repo-wide
+    /// scan picks the first test file alphabetically (e.g. `core/` before
+    /// `packages/`), but the module under test may live in a different subtree.
+    /// When an editable_path sits outside the detected test_dir, look for a
+    /// co-located test file near it; if found, that's the real convention for
+    /// this slice. If none exists but the editable_path is in a clear source
+    /// dir, co-locate the test there (standard TDD layout).
+    // ponytail: first editable_path wins; slices are single-subtree by design.
+    pub fn for_editable_paths(&self, editable_paths: &[String], root: &Path) -> Conventions {
+        let Some(first) = editable_paths.first() else {
+            return self.clone();
+        };
+        let edit_parent = Path::new(first)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_string_lossy()
+            .to_string();
+
+        // Already aligned — detected test_dir IS (or contains) the editable
+        // path's directory. No adjustment needed.
+        if self.test_dir == edit_parent
+            || edit_parent.starts_with(&format!("{}/", self.test_dir.trim_end_matches('/')))
+            || self.test_dir == "."
+        {
+            return self.clone();
+        }
+
+        // Look for an existing test file co-located with the editable path.
+        let co_located = find_test_file(root, &root.join(&edit_parent), 1);
+        if let Some(rel) = &co_located {
+            let p = Path::new(rel);
+            let dir = p
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".into());
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            let ext = [".test.ts", ".test.js", ".spec.ts", ".spec.js"]
+                .iter()
+                .find(|s| name.ends_with(*s))
+                .copied()
+                .unwrap_or(&self.test_file_ext);
+            return Conventions {
+                test_dir: dir.clone(),
+                test_pattern: format!("{dir}/*{ext} ({})", self.test_runner),
+                test_file_ext: ext.to_string(),
+                example_test: Some(rel.clone()),
+                ..self.clone()
+            };
+        }
+
+        // No co-located test exists, but editable_path is in a different
+        // subtree than the detected convention. Co-locate: put the test next
+        // to the module being created (standard practice in monorepos).
+        Conventions {
+            test_dir: edit_parent.clone(),
+            test_pattern: format!("{edit_parent}/*{} ({})", self.test_file_ext, self.test_runner),
+            example_test: None,
+            ..self.clone()
+        }
+    }
+
     pub fn prompt_block(&self) -> String {
         let mut block = format!(
             "- Language: {}\n- Test runner: {}\n- Test directory: {}\n- Test file pattern: {}\n- Test file extension: {}",
@@ -248,6 +310,92 @@ mod tests {
     fn returns_none_for_empty() {
         let tmp = tempfile_dir();
         assert!(detect(&tmp).is_none());
+    }
+
+    // --- #13: path-aware conventions for packages/ layout ---
+
+    #[test]
+    fn for_editable_paths_overrides_when_module_in_different_subtree() {
+        // Repo has tests in core/ (found first alphabetically) but the slice
+        // targets packages/worldgen/src/. Convention must follow the module.
+        let tmp = tempfile_dir();
+        std::fs::write(
+            tmp.join("package.json"),
+            r#"{"devDependencies": {"vitest": "^2", "typescript": "^5"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.join("core")).unwrap();
+        std::fs::write(tmp.join("core/economy.test.ts"), "// test").unwrap();
+        std::fs::create_dir_all(tmp.join("packages/worldgen/src")).unwrap();
+        // Co-located test in the packages subtree:
+        std::fs::write(
+            tmp.join("packages/worldgen/src/terrain.test.ts"),
+            "// test",
+        )
+        .unwrap();
+
+        let conv = detect(&tmp).unwrap();
+        assert_eq!(conv.test_dir, "core"); // global scan found core/ first
+
+        let adjusted =
+            conv.for_editable_paths(&["packages/worldgen/src/continents.ts".into()], &tmp);
+        assert_eq!(adjusted.test_dir, "packages/worldgen/src");
+        assert_eq!(adjusted.test_file_ext, ".test.ts");
+        assert!(adjusted
+            .example_test
+            .as_ref()
+            .unwrap()
+            .contains("terrain.test.ts"));
+    }
+
+    #[test]
+    fn for_editable_paths_colocates_when_no_existing_test_nearby() {
+        // No test file in packages/worldgen/src/ yet — co-locate the test
+        // in the editable path's directory rather than sending it to core/.
+        let tmp = tempfile_dir();
+        std::fs::write(
+            tmp.join("package.json"),
+            r#"{"devDependencies": {"vitest": "^2", "typescript": "^5"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.join("core")).unwrap();
+        std::fs::write(tmp.join("core/economy.test.ts"), "// test").unwrap();
+        std::fs::create_dir_all(tmp.join("packages/worldgen/src")).unwrap();
+
+        let conv = detect(&tmp).unwrap();
+        let adjusted =
+            conv.for_editable_paths(&["packages/worldgen/src/bandits.ts".into()], &tmp);
+        assert_eq!(adjusted.test_dir, "packages/worldgen/src");
+        assert_eq!(adjusted.example_test, None);
+    }
+
+    #[test]
+    fn for_editable_paths_no_change_when_already_aligned() {
+        let tmp = tempfile_dir();
+        std::fs::write(
+            tmp.join("package.json"),
+            r#"{"devDependencies": {"vitest": "^2", "typescript": "^5"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.join("core")).unwrap();
+        std::fs::write(tmp.join("core/economy.test.ts"), "// test").unwrap();
+
+        let conv = detect(&tmp).unwrap();
+        let adjusted = conv.for_editable_paths(&["core/happiness.ts".into()], &tmp);
+        assert_eq!(adjusted.test_dir, conv.test_dir);
+    }
+
+    #[test]
+    fn for_editable_paths_empty_returns_clone() {
+        let tmp = tempfile_dir();
+        std::fs::write(
+            tmp.join("package.json"),
+            r#"{"devDependencies": {"vitest": "^2"}}"#,
+        )
+        .unwrap();
+        let conv = detect(&tmp).unwrap();
+        let adjusted = conv.for_editable_paths(&[], &tmp);
+        assert_eq!(adjusted.test_dir, conv.test_dir);
     }
 
     fn tempfile_dir() -> std::path::PathBuf {

@@ -920,3 +920,58 @@ fn plan_carries_forward_project_lessons() {
     assert!(stdout.contains("Project lessons"), "{stdout}");
     assert!(stdout.contains("--runInBand"), "{stdout}");
 }
+
+// #10a: when all configured planner models fail, `hector plan` MUST exit
+// non-zero and MUST NOT write a campaign file. Automation reads exit codes;
+// exit 0 on total failure is a silent data-loss bug.
+#[test]
+fn plan_all_models_fail_exits_nonzero_no_campaign() {
+    let dir = tmp_dir("hector-all-fail");
+    // Repo shape: JS so conventions::detect succeeds.
+    fs::write(
+        dir.join("package.json"),
+        r#"{"devDependencies": {"vitest": "^2", "typescript": "^5"}}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/app.ts"), "export const X = 1;").unwrap();
+    // Model config pointing at a dead endpoint (port 1 = connection refused,
+    // fails instantly — no 120s curl timeout wasted).
+    fs::write(
+        dir.join("hector.yaml"),
+        "models:\n  - {name: dead, model: \"test/model\", base_url: \"http://127.0.0.1:1/v1\"}\ndefault_model: dead\n",
+    )
+    .unwrap();
+    // Spec is required for the LLM path.
+    let spec = dir.join("spec.md");
+    fs::write(&spec, "# Spec\nAdd function foo() that returns 42.").unwrap();
+
+    let out = hector_in(
+        &dir,
+        &[
+            "plan",
+            "--task",
+            "Add foo().",
+            "--spec",
+            spec.to_str().unwrap(),
+            "--editable-path",
+            "src/app.ts",
+            "--out",
+            dir.join("campaign.yaml").to_str().unwrap(),
+        ],
+    );
+
+    // MUST be non-zero exit — this is the regression being pinned.
+    assert!(
+        !out.status.success(),
+        "#10a regression: all models failed but hector exited 0.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // No campaign file written — a stale/empty file would mislead dispatch.
+    assert!(
+        !dir.join("campaign.yaml").exists(),
+        "campaign.yaml must not be written when all models fail"
+    );
+}

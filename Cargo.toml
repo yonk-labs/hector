@@ -1,6 +1,6 @@
 [package]
 name = "hector"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 description = "TDD slice planner for Bob campaigns"
 license = "Apache-2.0"
