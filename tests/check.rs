@@ -975,3 +975,103 @@ fn plan_all_models_fail_exits_nonzero_no_campaign() {
         "campaign.yaml must not be written when all models fail"
     );
 }
+
+// #10a (reachable variant): the original field regression was NOT a dead port —
+// it was a REACHABLE endpoint whose every response was unusable. The connection-
+// refused test above can't catch a regression where hector treats "got a
+// response, couldn't use it" as success. Here a real in-process listener answers
+// every request with a 200 whose body is not JSON, so the model client's parse
+// step fails on every retry/rotation. hector MUST still exit non-zero and write
+// no campaign.
+#[test]
+fn plan_reachable_endpoint_all_responses_unusable_exits_nonzero_no_campaign() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let dir = tmp_dir("hector-reachable-fail");
+    fs::write(
+        dir.join("package.json"),
+        r#"{"devDependencies": {"vitest": "^2", "typescript": "^5"}}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/app.ts"), "export const X = 1;").unwrap();
+
+    // Reachable listener on an ephemeral port. It answers every request with a
+    // 200 OK whose body is not JSON — model::complete parses the body as JSON
+    // and bails, so the model fails on every attempt (never a hang, never a
+    // usable plan).
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let handle = std::thread::spawn(move || {
+        // Content-Length matches the 11-byte body exactly; Connection: close so
+        // curl finishes each request cleanly and the loop serves the next one.
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                        Content-Length: 11\r\nConnection: close\r\n\r\nnot json ok";
+        while !stop_thread.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // Best-effort drain of the request so curl doesn't see a RST
+                    // mid-send; we don't need the body, only to answer it.
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                        .ok();
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    fs::write(
+        dir.join("hector.yaml"),
+        format!(
+            "models:\n  - {{name: reachable, model: \"test/model\", \
+             base_url: \"http://127.0.0.1:{port}/v1\"}}\ndefault_model: reachable\n"
+        ),
+    )
+    .unwrap();
+    let spec = dir.join("spec.md");
+    fs::write(&spec, "# Spec\nAdd function foo() that returns 42.").unwrap();
+
+    let out = hector_in(
+        &dir,
+        &[
+            "plan",
+            "--task",
+            "Add foo().",
+            "--spec",
+            spec.to_str().unwrap(),
+            "--editable-path",
+            "src/app.ts",
+            "--out",
+            dir.join("campaign.yaml").to_str().unwrap(),
+        ],
+    );
+
+    // Stop the listener before asserting so a failure can't leak the thread.
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
+
+    assert!(
+        !out.status.success(),
+        "#10a regression: reachable endpoint returned unusable responses but hector exited 0.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("campaign.yaml").exists(),
+        "campaign.yaml must not be written when every model response is unusable"
+    );
+}

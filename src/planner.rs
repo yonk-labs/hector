@@ -265,20 +265,45 @@ fn tail_str(s: &str, max: usize) -> String {
 /// modules under test). Returns None when the text before the marker isn't a
 /// plain identifier (e.g. `Class extends value #<Object> is not a constructor`
 /// — nothing nameable there).
+/// First quote-delimited token (either `'` or `"`) in `text` that looks like a
+/// module path — non-empty and whitespace-free. Scanning every quote position
+/// rather than pairing them lets a stray apostrophe (webpack's "Can't resolve")
+/// fall through to the real `./x` that follows.
+fn first_quoted_path(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if *c == '\'' || *c == '"' {
+            let token: String = chars[i + 1..]
+                .iter()
+                .take_while(|c| **c != '\'' && **c != '"')
+                .collect();
+            if !token.is_empty() && !token.chars().any(char::is_whitespace) {
+                return Some(token);
+            }
+        }
+    }
+    None
+}
+
 fn extract_missing_symbol(output: &str) -> Option<String> {
-    // "Cannot find module 'packages/worldgen/src/bandits'" — the quoted path
-    // is what's missing. Returned as-is (caller checks against editable_paths).
-    const MODULE_MARKERS: &[&str] = &["Cannot find module", "Cannot find module"];
+    // A brand-new module under test surfaces under several runner-specific
+    // phrasings; the quoted module path is what's missing (returned as-is —
+    // the caller checks it against editable_paths):
+    //   Node/jest:  Cannot find module '../src/body'      (path adjacent)
+    //   webpack:    Module not found: Error: Can't resolve './x'  (NOT adjacent,
+    //               and "Can't" even sneaks in a stray apostrophe)
+    //   vitest:     Failed to resolve import "./x" from "y.test.ts"
+    // For each marker we scan forward for the first *quoted, whitespace-free*
+    // token — scanning every quote (not pairing them) steps past webpack's
+    // "Can't" apostrophe and lands on the real path.
+    const MODULE_MARKERS: &[&str] = &[
+        "Cannot find module",
+        "Module not found",
+        "Failed to resolve import",
+    ];
     for marker in MODULE_MARKERS {
         if let Some(idx) = output.find(marker) {
-            let after = output[idx + marker.len()..].trim_start();
-            // Strip surrounding quotes: '...' or "..."
-            let stripped = after.trim_start_matches(['\'', '"']);
-            let path: String = stripped
-                .chars()
-                .take_while(|c| *c != '\'' && *c != '"')
-                .collect();
-            if !path.is_empty() {
+            if let Some(path) = first_quoted_path(&output[idx + marker.len()..]) {
                 return Some(path);
             }
         }
@@ -348,12 +373,13 @@ fn is_infrastructure_error(output: &str, base_prompt: &str, editable_paths: &[St
         "err_module_not_found",
         "referenceerror",
         "module not found",
+        "failed to resolve import",
         "no such file or directory",
         "class extends value",
         "has no exported member",
     ];
     // But NOT when it's clearly an assertion failure that happens to contain a keyword
-    if lower.contains("expected:") && lower.contains("received:")
+    if (lower.contains("expected:") && lower.contains("received:"))
         || lower.contains("assertionerror")
         || lower.contains("number of assertions")
     {
@@ -366,7 +392,10 @@ fn is_infrastructure_error(output: &str, base_prompt: &str, editable_paths: &[St
         // #24: "Cannot find module 'packages/worldgen/src/bandits'" — the
         // extracted value is a path. If it matches an editable_path (the file
         // bob will create), this is a brand-new module under test, not a typo.
-        if lower.contains("cannot find module") || lower.contains("module not found") {
+        if lower.contains("cannot find module")
+            || lower.contains("module not found")
+            || lower.contains("failed to resolve import")
+        {
             // #24: only editable_paths can prove this is a brand-new module
             // under test. Prompt matching is too loose — reference paths
             // (read-only files) would false-positive.
@@ -395,10 +424,7 @@ fn is_editable_module(module_path: &str, editable_paths: &[String]) -> bool {
         .filter(|s| !s.is_empty() && *s != "." && *s != "..")
         .collect::<Vec<_>>()
         .join("/");
-    let normalized_basename = Path::new(&normalized)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&normalized);
+    let module_stem = strip_ts_ext(&normalized);
     for editable in editable_paths {
         let edit_normalized: String = editable
             .split('/')
@@ -414,17 +440,44 @@ fn is_editable_module(module_path: &str, editable_paths: &[String]) -> bool {
         {
             return true;
         }
-        // Basename match (the test imported a different relative path but the
-        // target file is the same editable_path).
-        let edit_basename = Path::new(&edit_normalized)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&edit_normalized);
-        if edit_basename == normalized_basename && !normalized_basename.is_empty() {
+        // Path-suffix match: the test imported a different relative path but it
+        // resolves to the same editable file. Compare by trailing path segments
+        // (extension-stripped) so a sibling './bandits' or a deeper
+        // './widgets/chart' matches packages/.../bandits.ts / src/widgets/chart.tsx.
+        // Requiring a full-segment suffix (not just a shared leaf stem) keeps a
+        // genuinely-different '../other/index' from matching an editable whose
+        // only commonality is the leaf name 'index' — that stem-only over-match
+        // re-opened the #24/#12 "unrunnable frozen test ships as red" failure mode.
+        if !module_stem.is_empty() && ends_with_segments(strip_ts_ext(&edit_normalized), module_stem)
+        {
             return true;
         }
     }
     false
+}
+
+/// Strip a trailing JS/TS module extension from a path (`foo/bar.tsx` → `foo/bar`).
+/// Module specifiers in import errors are usually extension-less; editable paths
+/// carry the real `.ts`/`.tsx`/etc., so both sides are stemmed before comparison.
+fn strip_ts_ext(path: &str) -> &str {
+    for ext in [".tsx", ".ts", ".jsx", ".js", ".mts", ".cts", ".mjs", ".cjs"] {
+        if let Some(stem) = path.strip_suffix(ext) {
+            return stem;
+        }
+    }
+    path
+}
+
+/// True when `full`'s trailing path segments equal all of `suffix`'s segments,
+/// e.g. `packages/worldgen/src/bandits` ends with `bandits` and with
+/// `src/bandits`, but not with `other/bandits`.
+fn ends_with_segments(full: &str, suffix: &str) -> bool {
+    let full_segs: Vec<&str> = full.split('/').filter(|s| !s.is_empty()).collect();
+    let suf_segs: Vec<&str> = suffix.split('/').filter(|s| !s.is_empty()).collect();
+    if suf_segs.is_empty() || suf_segs.len() > full_segs.len() {
+        return false;
+    }
+    full_segs[full_segs.len() - suf_segs.len()..] == suf_segs[..]
 }
 
 /// #12 backstop: after the classifier says "not infra" (legitimate red), check
@@ -441,7 +494,13 @@ fn looks_like_test_failure(output: &str) -> bool {
         "assertionerror",  // JS AssertionError class
         "tests:",          // test runner summary ("Tests: 1 failed, 3 passed")
         "test suites:",    // jest summary
-        "fail",            // "FAIL" / "failed" / "failing"
+        // Runner-specific failure shapes — deliberately NOT a bare "fail", which
+        // matched generic noise ("Command failed with exit code 1"). These only
+        // hit real summary/banner lines:
+        "failed,",         // jest summary ("1 failed, 3 passed")
+        "failed |",        // vitest summary ("1 failed | 3 passed")
+        "failing",         // mocha summary ("3 failing")
+        "fail ",           // jest/vitest FAIL banner ("FAIL src/app.test.ts")
         "✓",               // vitest pass marker (at least some tests ran)
         "✗",               // vitest fail marker
         "passed",          // "3 passed"
@@ -452,8 +511,9 @@ fn looks_like_test_failure(output: &str) -> bool {
         "is not defined",    // missing-symbol-under-test
         "is not a constructor", // missing-symbol-under-test
         "has no exported member", // TS missing export (TDD red for new export)
-        "cannot find module", // new-module-under-test (TDD red for new module)
-        "error:",           // generic error that still indicates a test ran
+        "cannot find module", // new-module-under-test (Node/jest)
+        "module not found",   // new-module-under-test (webpack)
+        "failed to resolve import", // new-module-under-test (vitest)
     ];
     MARKERS.iter().any(|m| lower.contains(m))
 }
@@ -678,6 +738,98 @@ mod infra_tests {
         assert!(out.chars().all(|c| c == 'é'));
         // Shorter than max: returned whole.
         assert_eq!(tail_str("hi", 100), "hi");
+    }
+
+    // --- Fix 1: real MODULE_MARKERS forms (webpack / vitest naming) ---
+
+    #[test]
+    fn node_cannot_find_module_editable_is_legit_red() {
+        // Node/jest form — the classic case, kept working.
+        let out = "Error: Cannot find module '../src/bandits'\nRequire stack:";
+        let editable = vec!["src/bandits.ts".to_string()];
+        assert!(!is_infrastructure_error(out, "", &editable));
+    }
+
+    #[test]
+    fn webpack_module_not_found_editable_is_legit_red() {
+        // Webpack: the module path isn't adjacent to the marker and "Can't"
+        // sneaks in a stray apostrophe — extraction must still land on './...'.
+        let out = "Module not found: Error: Can't resolve './widgets/chart' in '/app/src'";
+        let editable = vec!["src/widgets/chart.tsx".to_string()];
+        assert!(!is_infrastructure_error(out, "", &editable));
+    }
+
+    #[test]
+    fn webpack_module_not_found_non_editable_still_infra() {
+        let out = "Module not found: Error: Can't resolve './lib/helpers' in '/app/src'";
+        let editable = vec!["src/widgets/chart.tsx".to_string()];
+        assert!(is_infrastructure_error(out, "", &editable));
+    }
+
+    #[test]
+    fn vitest_failed_to_resolve_import_editable_is_legit_red() {
+        // Vitest/Vite: double-quoted path follows the marker.
+        let out = "Failed to resolve import \"../src/bandits\" from \"tests/bandits.test.ts\". Does the file exist?";
+        let editable = vec!["src/bandits.ts".to_string()];
+        assert!(!is_infrastructure_error(out, "", &editable));
+    }
+
+    #[test]
+    fn vitest_failed_to_resolve_import_non_editable_still_infra() {
+        let out = "Failed to resolve import \"../src/missingHelper\" from \"tests/bandits.test.ts\".";
+        let editable = vec!["src/bandits.ts".to_string()];
+        assert!(is_infrastructure_error(out, "", &editable));
+    }
+
+    // --- Fix 4: basename fallback must not over-match common leaf names ---
+
+    #[test]
+    fn editable_index_does_not_over_match_unrelated_index_module() {
+        // Editable file has a common leaf (index.ts). A genuinely broken import
+        // of a DIFFERENT multi-segment index must stay infra — the basename
+        // fallback only fires for bare-leaf specifiers (#24/#12 regression).
+        let out = "Error: Cannot find module '../other/index'\nRequire stack:";
+        let editable = vec!["packages/worldgen/src/index.ts".to_string()];
+        assert!(is_infrastructure_error(out, "", &editable));
+    }
+
+    #[test]
+    fn bare_leaf_sibling_import_still_matches_editable_basename() {
+        // './bandits' is a bare leaf specifier resolving to the editable
+        // packages/worldgen/src/bandits.ts — the path-suffix match correctly fires.
+        let out = "Error: Cannot find module './bandits'\nRequire stack:";
+        let editable = vec!["packages/worldgen/src/bandits.ts".to_string()];
+        assert!(!is_infrastructure_error(out, "", &editable));
+    }
+
+    // --- Fix 3: #12 backstop rejects pure infra noise, keeps runner output ---
+
+    #[test]
+    fn backstop_accepts_genuine_runner_output() {
+        // jest summary
+        assert!(super::looks_like_test_failure("Tests: 1 failed, 3 passed, 4 total"));
+        // vitest summary (pipe-delimited counts)
+        assert!(super::looks_like_test_failure(
+            " Test Files  1 failed | 1 passed\n Tests  1 failed | 3 passed"
+        ));
+        // assertion diff
+        assert!(super::looks_like_test_failure("Expected: 5\nReceived: 6"));
+        // jest FAIL banner on its own
+        assert!(super::looks_like_test_failure("FAIL src/app.test.ts"));
+    }
+
+    #[test]
+    fn backstop_rejects_pure_infra_noise() {
+        // Connection error — no test vocabulary at all.
+        assert!(!super::looks_like_test_failure(
+            "Error: connect ECONNREFUSED 127.0.0.1:9"
+        ));
+        // Runner spawn failure — "failed with" must not read as a test failure.
+        assert!(!super::looks_like_test_failure("Command failed with exit code 1"));
+        // Bare stack trace of Error: lines — "error:" was removed as a marker.
+        assert!(!super::looks_like_test_failure(
+            "Error: boom\n    at foo (bar.js:1:2)\n    at baz (qux.js:3:4)"
+        ));
     }
 }
 
