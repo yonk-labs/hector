@@ -1231,6 +1231,83 @@ slices:
         assert!(!is_verify_start(""));
     }
 
+    // --- bob 0.5.0 compat: new events.jsonl event types + run.json error/stop_reason ---
+
+    #[test]
+    fn bob_050_new_event_types_never_misidentified_as_verify_start() {
+        // A realistic bob 0.5.0 events.jsonl for a run that never reaches verify
+        // (endpoint dead → fallback exhausted → builder_error → run_end/error).
+        // Every one of these event types is new or changed in 0.5.0; none of
+        // them may trip is_verify_start, and run_end is now guaranteed to fire
+        // even on total failure.
+        let events = r#"{"event":"run_start","base_sha":"abc123","model":"qwen-193"}
+{"event":"builder_start","iter":0,"model":"qwen-193"}
+{"event":"fallback_start","attempt":1,"model":"gemma-133","reason":"qwen-193: health_check_failed"}
+{"event":"builder_timeout","iter":0,"model":"gemma-133","elapsed_secs":300,"detail":"timed out"}
+{"event":"builder_idle_stall","iter":0,"model":"gemma-133","elapsed_secs":120,"detail":"idle-stalled"}
+{"event":"builder_error","iter":0,"model":"gemma-133","elapsed_secs":5,"detail":"spawn failed"}
+{"event":"run_end","status":"error","stop_reason":"BuilderError"}"#;
+
+        assert!(
+            !events.lines().any(is_verify_start),
+            "none of bob 0.5.0's new event types should match verify_start"
+        );
+        // Individually too, and no panics parsing any of them.
+        for line in events.lines() {
+            assert!(!is_verify_start(line), "misidentified as verify_start: {line}");
+        }
+        // A genuine verify_start elsewhere in the stream is still detected —
+        // the new event types don't shadow the real one.
+        let mixed = format!("{events}\n{{\"event\":\"verify_start\",\"iter\":1,\"focused\":true}}");
+        assert!(mixed.lines().any(is_verify_start));
+    }
+
+    #[test]
+    fn bob_050_error_status_with_builder_error_stop_reason_is_failed_with_reason_surfaced() {
+        // Realistic bob 0.5.0 run.json for a total fallback-chain exhaustion
+        // (dead endpoint, ~5s exit) — status "error", stop_reason "BuilderError",
+        // both new/changed in 0.5.0. Mirrors the field extraction in run_slice.
+        let run_json: serde_json::Value = serde_json::from_str(
+            r#"{
+                "status": "error",
+                "next_action": "human_decision_required",
+                "run_id": "r1",
+                "base_sha": "",
+                "worktree": "",
+                "artifact_dir": ".bob/runs/r1",
+                "iterations": 0,
+                "applied": false,
+                "stop_reason": "BuilderError",
+                "changed_files": [],
+                "builder": {"model": null, "failure_kind": "", "fallbacks_tried": []},
+                "final_diff": ""
+            }"#,
+        )
+        .unwrap();
+
+        let status = run_json
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let stop_reason = run_json
+            .get("stop_reason")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        assert!(!is_success(&status), "bob's \"error\" status must count as failed");
+        assert_eq!(stop_reason.as_deref(), Some("BuilderError"));
+
+        // And the other new stop_reason value, "NoProgress", surfaces the same way.
+        let no_progress: serde_json::Value =
+            serde_json::json!({"status": "error", "stop_reason": "NoProgress"});
+        let stop_reason2 = no_progress
+            .get("stop_reason")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        assert_eq!(stop_reason2.as_deref(), Some("NoProgress"));
+    }
+
     #[test]
     fn round_robin_spreads_unpinned_same_tier_slices() {
         let tiers: HashMap<String, Vec<String>> = [(
